@@ -646,6 +646,15 @@ def _link_tasks(md, hub_name, topic=None):
     return "\n".join(out)
 
 
+def _tag_topic(lines, topic):
+    """이번 콜에서 새로 생긴 줄(링크 없음)에 그 날짜의 주제 태그를 붙인다.
+    날짜 그룹마다 topic 이 다를 수 있으므로 루프 안에서 그때그때 붙여야 한다 —
+    마지막 날짜의 topic 을 전부에 붙이면 다른 날 생긴 태스크가 엉뚱한 주제로 간다."""
+    if not topic:
+        return lines
+    return [l if "[[" in l else f"{l}  [[{TOPICS_DIRNAME}/{topic}|🔧]]" for l in lines]
+
+
 def _task_topic(line):
     """태스크 줄에 심긴 주제 슬러그."""
     m = re.search(r"\[\[" + re.escape(TOPICS_DIRNAME) + r"/([^|\]]+)", line)
@@ -698,6 +707,10 @@ def _safe_write_tasks(tasks_path, new_md):
     if cur_n >= 1 and new_n == 0:
         _debug(f"[worker] 작업현황 덮어쓰기 거부(와이프 방지): {cur_n}→0")
         return False
+    if new_n < cur_n:
+        # 정당한 감소(아카이브 이동·항목 병합)도 있으므로 막지는 않는다.
+        # 다만 LLM 이 조용히 항목을 떨어뜨리는 경우를 사후에 알 수 있어야 한다.
+        _debug(f"[worker] 작업현황 항목 감소: {cur_n}→{new_n} (직전 사본 .task-backups/)")
     if cur.strip():
         _backup_tasks(tasks_path, cur)
     tmp = tasks_path + ".tmp"
@@ -711,6 +724,13 @@ def _update_tasks(base, tasks_markdown, done_cur, hub_name, db_path=DB_FILE, top
     """LLM 미완료 결과 + 기존 완료(보존·아카이브) → 작업현황 안전 갱신.
     완료일은 task_events의 실제 완료 시각(FileChanged로 포착) 우선."""
     _sync_task_states(base, db_path)  # 폴백: 아직 미기록된 완료 전이 포착
+    # done 은 호출자가 넘긴 스냅샷이 아니라 **지금 파일**에서 다시 읽는다.
+    # 락을 쥔 채 LLM 을 기다리는 37~91초 사이에 사람이 체크한 항목이 있으면,
+    # 옛 스냅샷으로 덮어쓸 때 그 체크가 조용히 되돌려진다.
+    tf_now = os.path.join(base, TASKS_FILENAME)
+    if os.path.exists(tf_now):
+        with open(tf_now, encoding="utf-8") as f:
+            _, done_cur = _split_tasks(f.read())
     today = datetime.now().strftime("%Y-%m-%d")
     open_new, _ = _split_tasks(tasks_markdown or "")
     done_keys = {_task_key(d) for d in done_cur}
@@ -1219,11 +1239,16 @@ def _process(transcript, base=None, db_path=DB_FILE, use_llm=True):
                               topic if on_topic else project,
                               summary["progress"],
                               f"{TOPICS_DIRNAME}/{topic}" if on_topic else hub_name)
+                # 날짜별 결과를 이어받는다. 마지막 요약만 쓰면 중간 날짜에서 나온 태스크가
+                # 통째로 사라진다 — 다중 활동일 flush 는 실측 42%(19건 중 8건)다.
+                # 태그도 여기서 붙인다(날짜마다 topic 이 다를 수 있다).
+                open_cur = _tag_topic(_split_tasks(summary["tasks_markdown"])[0],
+                                      topic if on_topic else None)
                 _debug(f"[worker] {date}: topic={topic or 'none'} 진행 로그·대화·데일리 기록")
 
             new_blocks.reverse()  # 최신이 위로
             _update_hub(base, meta, hub_name, sid8, new_blocks, last_summary["resume"], started)
-            _update_tasks(base, last_summary["tasks_markdown"], done_cur, hub_name, db_path,
+            _update_tasks(base, "\n".join(open_cur), done_cur, hub_name, db_path,
                           last_summary.get("topic"))
             _write_index(base)    # topics/ + 작업현황 → INDEX.md 재생성 (0토큰)
             # 이번 flush가 건드린 모든 주차 + 이번 주를 재생성 (주 경계 넘김 대응)
