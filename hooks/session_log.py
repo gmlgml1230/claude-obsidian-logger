@@ -761,6 +761,16 @@ def _hub_frontmatter(meta, next_step, started, updated):
     return "\n".join(head)
 
 
+def _drop_progress_block(progress, header):
+    """진행 로그에서 같은 헤더의 블록을 제거한다 (다음 '### ' 직전 또는 끝까지).
+    같은 날 두 번 flush 되면 같은 (날짜, sid8) 블록이 쌓이므로 옛 것을 걷어낸다."""
+    i = progress.find(header)
+    if i == -1:
+        return progress
+    j = progress.find("\n### ", i + 1)
+    return (progress[:i] + (progress[j + 1:] if j != -1 else "")).rstrip()
+
+
 def _update_hub(base, meta, hub_name, sid8, new_blocks, next_step, started):
     """허브 노트: frontmatter·🔜 다음 갱신 + 📈 진행 로그에 새 블록 prepend(최신 위).
     기존 노트가 구형(진행 로그 없음)이면 기존 본문은 아래에 보존."""
@@ -777,6 +787,10 @@ def _update_hub(base, meta, hub_name, sid8, new_blocks, next_step, started):
         else:
             parts = txt.split("\n---\n", 1)  # frontmatter 이후 본문 보존
             old_body = (parts[1] if len(parts) == 2 else txt).strip()
+
+    # 같은 (날짜, sid8) 블록이 이미 있으면 옛 것을 제거하고 새 것으로 갈음한다.
+    for b in new_blocks:
+        existing_progress = _drop_progress_block(existing_progress, b.split("\n", 1)[0])
 
     today = datetime.now().strftime("%Y-%m-%d")
     out = [_hub_frontmatter(meta, next_step, started, today), "",
