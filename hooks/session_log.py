@@ -451,10 +451,10 @@ def render_conversation_for_summary(meta):
     return "\n\n".join(parts)
 
 
-def build_summary_prompt(meta, current_tasks, slugs=()):
+def build_summary_prompt(meta, current_tasks, choices=()):
     conversation = render_conversation_for_summary(meta)
     title = meta.get("title") or "(제목 없음)"
-    slug_list = "\n".join(f"- {s}" for s in slugs) or "- (등록된 주제 없음)"
+    slug_list = "\n".join(f"- {sl} — {ti}" for sl, ti in choices) or "- (등록된 주제 없음)"
     instructions = """너는 내 작업 기록 비서다. 아래는 한 프로젝트 세션에서 '이번에 새로 진행한 대화'다. 읽고 뽑아라.
 
 - topic: 이 대화가 속한 주제 슬러그를 '# 주제 목록'에서 **정확히 하나** 골라라. 해당 없으면 "none".
@@ -514,7 +514,7 @@ def call_claude(prompt):
     return proc.stdout if proc.returncode == 0 else None
 
 
-def summarize(meta, current_tasks, use_llm=True, slugs=()):
+def summarize(meta, current_tasks, use_llm=True, choices=()):
     title = meta.get("title") or "세션"
     fallback = {
         "topic": None,
@@ -524,7 +524,7 @@ def summarize(meta, current_tasks, use_llm=True, slugs=()):
     }
     if not use_llm:
         return {**fallback, "progress": f"- [{title}] (dry-run)", "resume": "(dry-run)"}
-    base_prompt = build_summary_prompt(meta, current_tasks, slugs)
+    base_prompt = build_summary_prompt(meta, current_tasks, choices)
     nudge = "\n\n[중요] 직전 응답이 형식에 안 맞았다. JSON 객체 하나만 출력하라."
     valid = None
     for attempt in range(SUMMARY_MAX_TRIES):
@@ -540,7 +540,7 @@ def summarize(meta, current_tasks, use_llm=True, slugs=()):
     topic = (valid["topic"] or "").strip()
     if topic.lower() in ("", "none", "null", "n/a"):
         topic = None
-    elif slugs and topic not in slugs:
+    elif choices and topic not in {sl for sl, _ in choices}:
         _debug(f"[worker] 미등록 슬러그 '{topic}' → none 처리")
         topic = None
     return {
@@ -709,7 +709,9 @@ def _render_turns(turns):
         ls = _clean_lines(lines)
         if not ls:
             continue  # 도구/로그만 있던 turn 은 저장하지 않음
-        out.append("### 👤 User" if role == "user" else "### 🤖 Assistant")
+        # 이모지만으로 역할이 구분되므로 'User'/'Assistant' 표기는 생략한다.
+        # (요약 프롬프트 쪽은 [User]/[Assistant] 를 유지 — 요약기에는 역할 라벨이 필요하다)
+        out.append("### 👤" if role == "user" else "### 🤖")
         out.append(_capped("\n".join(ls)))
         out.append("")
     return "\n".join(out).rstrip() + "\n"
@@ -822,6 +824,22 @@ def _topic_meta(path):
                 meta["next"] = s
                 break
     return meta
+
+
+def _topic_choices(base):
+    """프롬프트에 줄 (slug, title) 목록. 완료(status: done) 주제는 제외.
+
+    슬러그만 주면 매칭이 안 된다 — 'session-memory-architecture' 라는 문자열만으로
+    그게 무슨 작업인지 요약기가 알 수 없기 때문. title 을 함께 준다.
+    """
+    d = os.path.join(base, TOPICS_DIRNAME)
+    out = []
+    for slug in _topic_slugs(base):
+        m = _topic_meta(os.path.join(d, f"{slug}.md"))
+        if (m.get("status") or "active") == "done":
+            continue
+        out.append((slug, m.get("title") or slug))
+    return out
 
 
 def _fm_set(txt, key, value):
@@ -1001,13 +1019,13 @@ def _process(transcript, base=None, db_path=DB_FILE, use_llm=True):
                 current_tasks = open(tf, encoding="utf-8").read()
             open_cur, done_cur = _split_tasks(current_tasks)
 
-            slugs = _topic_slugs(base)   # 닫힌 선택지로 프롬프트에 동봉 (결정 E·P)
+            choices = _topic_choices(base)   # (slug, title) 닫힌 선택지
             groups = _group_by_date(new_turns, started)
             new_blocks = []       # (progress log 블록)
             last_summary = None
             for date, dturns in groups:
                 dmeta = {**meta, "turns": dturns}
-                summary = summarize(dmeta, "\n".join(open_cur), use_llm=use_llm, slugs=slugs)
+                summary = summarize(dmeta, "\n".join(open_cur), use_llm=use_llm, choices=choices)
                 last_summary = summary
                 _write_conversation_page(base, sid8, date, hub_name, dturns, meta.get("title"))
                 prog = summary["progress"].rstrip()
