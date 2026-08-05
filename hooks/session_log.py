@@ -27,6 +27,7 @@ import json
 import re
 import glob
 import fcntl
+import difflib
 import sqlite3
 import contextlib
 import subprocess
@@ -464,12 +465,18 @@ def build_summary_prompt(meta, current_tasks, choices=()):
 - tasks_markdown: 현재 미완료 작업 목록을 유지하되 - [ ] 체크박스 목록 전체를 반환.
   · 기존 항목 보존, 관련 작업은 하나로 묶기(과도 분할 금지), 새 작업은 관련끼리 묶어 추가.
   · 완료 판정·삭제·체크(- [x]) 변경 금지(완료는 사용자가 직접). 기존 `[[...]]` 링크 보존, 새 링크 만들지 마라.
+- conclusions: **다음에 같은 작업을 할 때 몰랐으면 헤맬 사실**만 배열로. 수치·조건·이유를 담아라.
+  · 이번에 무엇을 했는지는 progress 의 몫이다. 여기 쓰지 마라.
+  · 해당 없으면 [] 로 두어라. 억지로 만들지 마라.
+- dropped: 이번 대화에서 **검토했다가 기각한 대안**을 "안 — 기각 이유" 형태 배열로.
+  · 기각 이유가 없으면 넣지 마라. 없으면 [].
 
 모든 답변 한국어. 확실치 않으면 짧게."""
     return (
         f"{instructions}\n\n"
         "반드시 아래 JSON 하나로만 답하라. 코드펜스/설명 금지. 값은 모두 문자열:\n"
-        '{"topic": "slug 또는 none", "progress": "- ...", "resume": "...", "tasks_markdown": "..."}\n\n'
+        '{"topic": "slug 또는 none", "progress": "- ...", "resume": "...",\n'
+        '  "conclusions": [], "dropped": [], "tasks_markdown": "..."}\n\n'
         f"# 주제 목록\n{slug_list}\n\n"
         f"# 프로젝트\n{title}\n\n"
         f"# 현재 미완료 작업\n{current_tasks or '(없음)'}\n\n"
@@ -494,8 +501,14 @@ def _valid_summary(parsed):
         v = parsed.get(k)
         if v is not None and not isinstance(v, str):
             return None
+    for k in ("conclusions", "dropped"):
+        v = parsed.get(k)
+        if v is not None and not isinstance(v, list):
+            return None
     return {
         "topic": parsed.get("topic"),
+        "conclusions": [str(x) for x in (parsed.get("conclusions") or []) if str(x).strip()],
+        "dropped": [str(x) for x in (parsed.get("dropped") or []) if str(x).strip()],
         "progress": parsed.get("progress"),
         "resume": parsed.get("resume"),
         "tasks_markdown": parsed.get("tasks_markdown"),
@@ -518,6 +531,8 @@ def summarize(meta, current_tasks, use_llm=True, choices=()):
     title = meta.get("title") or "세션"
     fallback = {
         "topic": None,
+        "conclusions": [],
+        "dropped": [],
         "progress": "- (요약 실패 — 대화 참조)",
         "resume": "(요약 실패 — 수동 확인 필요)",
         "tasks_markdown": current_tasks or "",
@@ -545,6 +560,8 @@ def summarize(meta, current_tasks, use_llm=True, choices=()):
         topic = None
     return {
         "topic": topic,
+        "conclusions": valid["conclusions"],
+        "dropped": valid["dropped"],
         "progress": valid["progress"] or fallback["progress"],
         "resume": valid["resume"] or fallback["resume"],
         "tasks_markdown": valid["tasks_markdown"] or (current_tasks or ""),
@@ -814,9 +831,57 @@ def _topic_slugs(base):
                   for p in glob.glob(os.path.join(d, "*.md")))
 
 
+def _section_items(txt, header):
+    """'## 헤더' 아래의 '- ' 항목들. 다음 '## ' 에서 멈춘다."""
+    i = txt.find(header)
+    if i == -1:
+        return []
+    out = []
+    for ln in txt[i + len(header):].splitlines():
+        s = ln.strip()
+        if s.startswith("## "):
+            break
+        if s.startswith("- ") and s != "- _(없음)_":
+            out.append(s[2:].strip())
+    return out
+
+
+def _dedup_against(items, existing, threshold=0.75):
+    """기존 항목과 유사한 것을 걸러낸다. 요약기는 기존 목록을 못 보므로
+    (topic 이 같은 콜에서 정해져 프롬프트에 미리 넣을 수 없다) 파이썬에서 막는다."""
+    def norm(s):
+        return re.sub(r"[\s`*_·,.\-—()\[\]]+", "", s).lower()
+
+    out, seen = [], [norm(e) for e in existing]
+    for it in items:
+        n = norm(it)
+        if not n:
+            continue
+        if any(n in e or e in n or difflib.SequenceMatcher(None, n, e).ratio() >= threshold
+               for e in seen):
+            continue
+        out.append(it.strip())
+        seen.append(n)   # 같은 응답 안에서의 중복도 막는다
+    return out
+
+
+def _append_section(txt, header, items):
+    """섹션 끝에 항목을 append. 섹션이 없으면 만들지 않는다(스키마 보존).
+    기존 줄은 절대 고치지 않는다 — 사람이 다듬은 문장을 훅이 덮지 않기 위함."""
+    if not items:
+        return txt
+    i = txt.find(header)
+    if i == -1:
+        return txt
+    j = txt.find("\n## ", i + 1)
+    body = (txt[i:j] if j != -1 else txt[i:]).replace("- _(없음)_", "").rstrip()
+    body += "\n" + "\n".join(f"- {x}" for x in items) + "\n"
+    return txt[:i] + body + (f"\n{txt[j + 1:]}" if j != -1 else "")
+
+
 def _topic_meta(path):
-    """frontmatter(status/title) + '🔜 다음' 첫 줄."""
-    meta = {"status": "active", "title": "", "next": ""}
+    """frontmatter(status/title/plan) + '🔜 다음' 첫 줄."""
+    meta = {"status": "active", "title": "", "next": "", "plan": ""}
     try:
         txt = open(path, encoding="utf-8").read()
     except OSError:
@@ -826,7 +891,7 @@ def _topic_meta(path):
         for ln in m.group(1).splitlines():
             k, _, v = ln.partition(":")
             k, v = k.strip(), v.strip().strip('"')
-            if k in ("status", "title"):
+            if k in ("status", "title", "plan"):
                 meta[k] = v
     i = txt.find(NEXT_HEADER)
     if i != -1:
@@ -868,7 +933,8 @@ def _fm_set(txt, key, value):
     return f"---\n{fm}\n---\n" + txt[m.end():]
 
 
-def _append_topic(base, slug, date, sid8, progress, next_step):
+def _append_topic(base, slug, date, sid8, progress, next_step,
+                  conclusions=(), dropped=()):
     """주제 파일의 📈 진행 로그에 prepend + frontmatter 갱신.
     파일이 없으면 만들지 않는다 — 신규 주제 생성은 사용자 지시로만(결정 E)."""
     path = os.path.join(base, TOPICS_DIRNAME, f"{slug}.md")
@@ -877,19 +943,29 @@ def _append_topic(base, slug, date, sid8, progress, next_step):
         return False
     txt = open(path, encoding="utf-8").read()
 
-    marker = f"### {date}  [[{CONV_DIRNAME}/{sid8}_{date}"
-    if marker in txt:  # 같은 (날짜, 세션) 블록 중복 append 방지
-        _debug(f"[worker] topics/{slug}: {date}/{sid8} 블록 이미 존재 — 건너뜀")
-        return True
+    # ① 결론·접은 안 — append 만 한다. 기존 줄은 고치지 않는다.
+    #    요약기는 기존 목록을 볼 수 없으므로(topic 이 같은 콜에서 정해진다) 여기서 중복을 막는다.
+    #    진행 로그 중복 여부와 **무관하게** 먼저 처리한다 — 같은 날 두 번째 flush 에서
+    #    새로 나온 결론이 유실되면 안 되기 때문이다.
+    for header, items in ((CONCLUSION_HEADER, conclusions), (DROPPED_HEADER, dropped)):
+        fresh = _dedup_against(list(items or ()), _section_items(txt, header))
+        if fresh:
+            txt = _append_section(txt, header, fresh)
+            _debug(f"[worker] topics/{slug}: {header} +{len(fresh)}건")
 
-    block = f"{marker}|💬 대화]]\n{progress.rstrip()}"
-    i = txt.find(PROGRESS_HEADER)
-    if i == -1:
-        txt = txt.rstrip() + f"\n\n{PROGRESS_HEADER}\n\n{block}\n"
+    # ② 진행 로그 — 같은 (날짜, 세션) 블록이 이미 있으면 이 단계만 건너뛴다.
+    marker = f"### {date}  [[{CONV_DIRNAME}/{sid8}_{date}"
+    if marker in txt:
+        _debug(f"[worker] topics/{slug}: {date}/{sid8} 진행 로그 블록 이미 존재 — 건너뜀")
     else:
-        head = txt[:i + len(PROGRESS_HEADER)]
-        tail = txt[i + len(PROGRESS_HEADER):].lstrip("\n")
-        txt = f"{head}\n\n{block}\n\n{tail}"
+        block = f"{marker}|💬 대화]]\n{progress.rstrip()}"
+        i = txt.find(PROGRESS_HEADER)
+        if i == -1:
+            txt = txt.rstrip() + f"\n\n{PROGRESS_HEADER}\n\n{block}\n"
+        else:
+            head = txt[:i + len(PROGRESS_HEADER)]
+            tail = txt[i + len(PROGRESS_HEADER):].lstrip("\n")
+            txt = f"{head}\n\n{block}\n\n{tail}"
 
     txt = _fm_set(txt, "updated", date)
     if next_step:
@@ -928,6 +1004,10 @@ def _write_index(base):
             continue
         line = (f"- [[{TOPICS_DIRNAME}/{slug}|{m.get('title') or slug}]] "
                 f"`{st}` — {m.get('next') or '_(다음 미기재)_'}")
+        # 설계 문서 포인터는 **지시문**으로 둔다. "그쪽에 있다"로 끝나는 서술문은
+        # 읽을지 여부를 읽는 쪽 판단에 맡기므로 전달이 보장되지 않는다.
+        if m.get("plan"):
+            line += f"\n  📄 먼저 `{m['plan']}` 를 읽어라. 전역 결정·기각 이력은 그쪽에 있다."
         (paused if st == "paused" else active).append(line)
 
     out = ["# 🧭 INDEX", "",
@@ -1049,7 +1129,8 @@ def _process(transcript, base=None, db_path=DB_FILE, use_llm=True):
                 prog = summary["progress"].rstrip()
                 topic = summary.get("topic")
                 on_topic = bool(topic) and _append_topic(
-                    base, topic, date, sid8, prog, summary["resume"])
+                    base, topic, date, sid8, prog, summary["resume"],
+                    summary.get("conclusions"), summary.get("dropped"))
                 # 주제에 붙였으면 hub 에는 포인터만 — 진행 로그 정본을 한 곳으로 유지한다.
                 # 양쪽에 같은 내용을 쓰면 한쪽을 사람이 고쳤을 때 조용히 분기한다.
                 head = f"### {date}  [[{CONV_DIRNAME}/{sid8}_{date}|💬 대화]]"
