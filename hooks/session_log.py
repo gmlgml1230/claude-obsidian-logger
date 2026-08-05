@@ -879,7 +879,8 @@ def _append_topic(base, slug, date, sid8, progress, next_step):
 
     txt = _fm_set(txt, "updated", date)
     if next_step:
-        txt = _fm_set(txt, "next", _yaml_val(next_step))
+        # '다음'의 정본은 '## 🔜 다음' 섹션 하나다 (_topic_meta 가 여기서 읽는다).
+        # frontmatter 에 next 를 중복 기록하지 않는다.
         j = txt.find(NEXT_HEADER)
         if j != -1:
             k = txt.find("\n##", j + 1)
@@ -1032,7 +1033,12 @@ def _process(transcript, base=None, db_path=DB_FILE, use_llm=True):
                 topic = summary.get("topic")
                 on_topic = bool(topic) and _append_topic(
                     base, topic, date, sid8, prog, summary["resume"])
-                new_blocks.append(f"### {date}  [[{CONV_DIRNAME}/{sid8}_{date}|💬 대화]]\n{prog}")
+                # 주제에 붙였으면 hub 에는 포인터만 — 진행 로그 정본을 한 곳으로 유지한다.
+                # 양쪽에 같은 내용을 쓰면 한쪽을 사람이 고쳤을 때 조용히 분기한다.
+                head = f"### {date}  [[{CONV_DIRNAME}/{sid8}_{date}|💬 대화]]"
+                new_blocks.append(
+                    f"{head}\n→ 진행 로그: [[{TOPICS_DIRNAME}/{topic}]]" if on_topic
+                    else f"{head}\n{prog}")
                 _append_daily(base, date,
                               topic if on_topic else project,
                               summary["progress"],
