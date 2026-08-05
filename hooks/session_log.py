@@ -82,6 +82,7 @@ NEXT_HEADER = "## 🔜 다음"
 # ── 주제축 (topics/) ────────────────────────────────────────────────
 TOPICS_DIRNAME = "topics"
 INDEX_FILENAME = "INDEX.md"
+TASK_TITLE_MAX = 80
 CONCLUSION_HEADER = "## 📌 결론"
 DROPPED_HEADER = "## ❌ 접은 안"
 
@@ -461,8 +462,12 @@ def build_summary_prompt(meta, current_tasks, choices=()):
 - topic: 이 대화가 속한 주제 슬러그를 '# 주제 목록'에서 **정확히 하나** 골라라. 해당 없으면 "none".
   · 목록에 없는 새 슬러그를 만들지 마라. 반드시 목록의 값 또는 "none" 이어야 한다.
 - progress: 이번에 '실제로 한 일'을 1~3개의 짧은 불릿(- ...)으로. 계획이 아니라 한 일.
-- resume: 다음에 '무엇부터 시작하면 되는지' 1~2줄(다음 행동).
+- resume: 재개 지점 + 남은 단계 요약. '지금 앉으면 무엇부터'로 시작하고, 남은 단계가 더 있으면
+  '① … → ② …' 로 이어 붙여라. 이 주제의 로드맵이며 매번 덮어쓴다.
 - tasks_markdown: 현재 미완료 작업 목록을 유지하되 - [ ] 체크박스 목록 전체를 반환.
+  · **주제의 다음 단계는 resume 에만 쓴다.** 순서가 있고 서로 의존하는 단계를 태스크로 쪼개지 마라.
+  · 태스크로 만들 것은 셋뿐이다 — ① 주제 밖 단발 작업, ② 주제 안이지만 순서 밖이라 잊기 쉬운 일,
+    ③ 완료 날짜를 남겨야 하는 일. 셋 중 어느 것도 아니면 만들지 마라.
   · 기존 항목 보존, 관련 작업은 하나로 묶기(과도 분할 금지), 새 작업은 관련끼리 묶어 추가.
   · 완료 판정·삭제·체크(- [x]) 변경 금지(완료는 사용자가 직접). 기존 `[[...]]` 링크 보존, 새 링크 만들지 마라.
 - conclusions: **다음에 같은 작업을 할 때 몰랐으면 헤맬 사실**만 배열로. 수치·조건·이유를 담아라.
@@ -624,14 +629,46 @@ def _archive_done(base, lines):
             f.write(l.rstrip() + "\n")
 
 
-def _link_tasks(md, hub_name):
+def _link_tasks(md, hub_name, topic=None):
+    """새 태스크에 세션 링크와 주제 태그를 붙인다.
+    주제 귀속은 태스크가 **생길 때**만 확실히 아는 정보다 — 나중에 텍스트 유사도로
+    추정하면 세션마다 답이 흔들린다. 이미 링크가 있는 줄은 다른 세션에서 온
+    기존 태스크이므로 이번 주제를 덧씌우지 않는다."""
     out = []
     for line in md.splitlines():
         s = line.rstrip()
-        if s.lstrip().lower().startswith(("- [ ]", "- [x]")) and "[[" not in s:
-            s = f"{s}  [[{hub_name}|↗ 세션]]"
+        if s.lstrip().lower().startswith(("- [ ]", "- [x]")):
+            if topic and "[[" not in s:
+                s = f"{s}  [[{TOPICS_DIRNAME}/{topic}|🔧]]"
+            if "↗ 세션]]" not in s:
+                s = f"{s}  [[{hub_name}|↗ 세션]]"
         out.append(s)
     return "\n".join(out)
+
+
+def _task_topic(line):
+    """태스크 줄에 심긴 주제 슬러그."""
+    m = re.search(r"\[\[" + re.escape(TOPICS_DIRNAME) + r"/([^|\]]+)", line)
+    return m.group(1).strip() if m else None
+
+
+def _restore_task_topics(open_lines, base):
+    """LLM 이 목록을 재작성하며 주제 태그를 떨어뜨려도 기존 파일에서 되살린다.
+    태그가 날아가면 그룹핑이 통째로 무너지므로 링크 보존 지시에만 기대지 않는다."""
+    tf = os.path.join(base, TASKS_FILENAME)
+    if not os.path.exists(tf):
+        return open_lines
+    prev = {}
+    with open(tf, encoding="utf-8") as f:
+        for l in f.read().splitlines():
+            t = _task_topic(l)
+            if t:
+                prev[_task_key(l)] = t
+    out = []
+    for l in open_lines:
+        t = prev.get(_task_key(l)) if not _task_topic(l) else None
+        out.append(f"{l}  [[{TOPICS_DIRNAME}/{t}|🔧]]" if t else l)
+    return out
 
 
 def _count_tasks(md):
@@ -670,7 +707,7 @@ def _safe_write_tasks(tasks_path, new_md):
     return True
 
 
-def _update_tasks(base, tasks_markdown, done_cur, hub_name, db_path=DB_FILE):
+def _update_tasks(base, tasks_markdown, done_cur, hub_name, db_path=DB_FILE, topic=None):
     """LLM 미완료 결과 + 기존 완료(보존·아카이브) → 작업현황 안전 갱신.
     완료일은 task_events의 실제 완료 시각(FileChanged로 포착) 우선."""
     _sync_task_states(base, db_path)  # 폴백: 아직 미기록된 완료 전이 포착
@@ -678,6 +715,7 @@ def _update_tasks(base, tasks_markdown, done_cur, hub_name, db_path=DB_FILE):
     open_new, _ = _split_tasks(tasks_markdown or "")
     done_keys = {_task_key(d) for d in done_cur}
     open_new = [o for o in open_new if _task_key(o) not in done_keys]
+    open_new = _restore_task_topics(open_new, base)
     done_stamped = [_stamp_done(d, _completion_date(_task_key(d), today, db_path)) for d in done_cur]
     cutoff = (datetime.now() - timedelta(days=DONE_RETAIN_DAYS)).strftime("%Y-%m-%d")
     recent, old = [], []
@@ -687,7 +725,7 @@ def _update_tasks(base, tasks_markdown, done_cur, hub_name, db_path=DB_FILE):
     if old:
         _archive_done(base, old)
         _debug(f"[worker] 완료 아카이브 이동: {len(old)}건")
-    composed = _link_tasks(_compose_tasks(open_new, recent), hub_name)
+    composed = _link_tasks(_compose_tasks(open_new, recent), hub_name, topic)
     _safe_write_tasks(os.path.join(base, TASKS_FILENAME), composed)
     _sync_task_states(base, db_path)  # 쓰기 후 snapshot 갱신
 
@@ -991,37 +1029,77 @@ def _append_topic(base, slug, date, sid8, progress, next_step,
     return True
 
 
+def _task_title(line):
+    """INDEX 표시용 짧은 제목. 상세는 작업현황.md 가 정본이므로 여기선 잘라도 된다
+    (한 줄이 300자를 넘는 태스크가 있어, 그대로 실으면 목차가 목차 구실을 못 한다)."""
+    s = re.sub(r"^\s*-\s*\[[ xX]\]\s*", "", line)
+    s = re.sub(r"\[\[.*?\]\]", "", s).strip()
+    head = s.split(": ", 1)[0].strip()
+    if len(head) >= 5:            # 'A: B' 형태면 A 가 제목이다. 너무 짧으면 오탐
+        s = head
+    return s if len(s) <= TASK_TITLE_MAX else s[:TASK_TITLE_MAX].rstrip() + "…"
+
+
+def _open_tasks_by_topic(base):
+    """미완료 태스크를 주제별로 나눈다 → ({slug: [제목]}, [무소속 제목])."""
+    by_topic, orphan = {}, []
+    tf = os.path.join(base, TASKS_FILENAME)
+    if not os.path.exists(tf):
+        return by_topic, orphan
+    with open(tf, encoding="utf-8") as f:
+        for l in f.read().splitlines():
+            if not l.lstrip().lower().startswith("- [ ]"):
+                continue
+            t, title = _task_topic(l), _task_title(l)
+            if t:
+                by_topic.setdefault(t, []).append(title)
+            else:
+                orphan.append(title)
+    return by_topic, orphan
+
+
 def _write_index(base):
     """topics/ 에서 INDEX.md 재생성 (0토큰). weekly 가 daily 에서 생성되는 것과 같은 방식.
-    작업현황 미완료도 같은 화면에 실어 '두 곳이 다른 답' 문제를 없앤다."""
+    작업현황 미완료를 주제 아래로 접어 넣어 '어느 프로젝트의 일인가'를 한눈에 보이게 한다."""
     d = os.path.join(base, TOPICS_DIRNAME)
     os.makedirs(d, exist_ok=True)
-    active, paused = [], []
+    by_topic, orphan = _open_tasks_by_topic(base)
+    entries = []
     for slug in _topic_slugs(base):
         m = _topic_meta(os.path.join(d, f"{slug}.md"))
         st = m.get("status") or "active"
-        if st == "done":
-            continue
-        line = (f"- [[{TOPICS_DIRNAME}/{slug}|{m.get('title') or slug}]] "
+        if st != "done":
+            entries.append((slug, m, st))
+    # 보류는 맨 아래에 실리므로 번호도 그 순서를 따른다 (sort 는 stable)
+    entries.sort(key=lambda e: e[2] == "paused")
+
+    # 번호는 이 렌더 한정의 순번이다 — 영구 ID 가 아니다.
+    # 지시는 INDEX 를 열어보고 하므로 사용자가 보는 번호와 여기 번호가 같은 파일에서 나온다.
+    # 그래서 다음 렌더에 밀려도 무해하다. 대신 **기록물(plan·topics)에는 번호를 쓰지 않는다** —
+    # 거기 적힌 번호는 다음 렌더에 거짓이 된다.
+    active, paused = [], []
+    for n, (slug, m, st) in enumerate(entries, 1):
+        line = (f"- **{n}.** [[{TOPICS_DIRNAME}/{slug}|{m.get('title') or slug}]] "
                 f"`{st}` — {m.get('next') or '_(다음 미기재)_'}")
         # 설계 문서 포인터는 **지시문**으로 둔다. "그쪽에 있다"로 끝나는 서술문은
         # 읽을지 여부를 읽는 쪽 판단에 맡기므로 전달이 보장되지 않는다.
         if m.get("plan"):
             line += f"\n  📄 먼저 `{m['plan']}` 를 읽어라. 전역 결정·기각 이력은 그쪽에 있다."
+        for j, title in enumerate(by_topic.pop(slug, ()), 1):
+            line += f"\n\t- [ ] **{n}-{j}** {title}"
         (paused if st == "paused" else active).append(line)
+    # 끝난(done) 주제나 사라진 슬러그에 달린 태스크는 흘려보내지 않고 기타로 모은다
+    for left in by_topic.values():
+        orphan += left
 
     out = ["# 🧭 INDEX", "",
            "> 주제 진입점. `topics/` 에서 자동 생성됩니다 — 직접 편집하지 마세요.", "",
            "## 🔧 진행 중", ""]
     out += active or ["_(없음)_"]
-    if paused:
+    if orphan:
+        out += ["", "## ☑️ 기타 태스크", ""] + [f"- [ ] {t}" for t in orphan]
+    if paused:  # 지금 손대지 않는 것이므로 맨 아래
         out += ["", "## ⏸ 보류", ""] + paused
-    tf = os.path.join(base, TASKS_FILENAME)
-    if os.path.exists(tf):
-        open_lines = [l.rstrip() for l in open(tf, encoding="utf-8").read().splitlines()
-                      if l.lstrip().lower().startswith("- [ ]")]
-        if open_lines:
-            out += ["", f"## ☑️ 태스크", ""] + open_lines
     with open(os.path.join(base, INDEX_FILENAME), "w", encoding="utf-8") as f:
         f.write("\n".join(out).rstrip() + "\n")
 
@@ -1145,7 +1223,8 @@ def _process(transcript, base=None, db_path=DB_FILE, use_llm=True):
 
             new_blocks.reverse()  # 최신이 위로
             _update_hub(base, meta, hub_name, sid8, new_blocks, last_summary["resume"], started)
-            _update_tasks(base, last_summary["tasks_markdown"], done_cur, hub_name, db_path)
+            _update_tasks(base, last_summary["tasks_markdown"], done_cur, hub_name, db_path,
+                          last_summary.get("topic"))
             _write_index(base)    # topics/ + 작업현황 → INDEX.md 재생성 (0토큰)
             # 이번 flush가 건드린 모든 주차 + 이번 주를 재생성 (주 경계 넘김 대응)
             weeks = {}

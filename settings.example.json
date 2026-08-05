@@ -16,16 +16,6 @@
         ]
       }
     ],
-    "SessionStart": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 ~/claude-obsidian-logger/hooks/session_start_inject.py"
-          }
-        ]
-      }
-    ],
     "FileChanged": [
       {
         "matcher": "📌 작업현황.md",
