@@ -883,9 +883,12 @@ def _append_topic(base, slug, date, sid8, progress, next_step):
         # frontmatter 에 next 를 중복 기록하지 않는다.
         j = txt.find(NEXT_HEADER)
         if j != -1:
+            # '🔜 다음' 이 마지막 섹션이면 find 가 -1 을 준다.
+            # txt[-1:] 로 흘러가면 마지막 문자가 뒤에 붙으므로 명시적으로 분기한다.
             k = txt.find("\n##", j + 1)
+            tail = txt[k:].lstrip("\n") if k != -1 else ""
             body = f"{NEXT_HEADER}\n\n- {next_step.strip()}\n"
-            txt = txt[:j] + body + (txt[k:].lstrip("\n") and "\n" + txt[k:].lstrip("\n") or "")
+            txt = txt[:j] + body + (f"\n{tail}" if tail else "")
     # sessions: [...] 에 sid8 추가
     ms = re.search(r"^sessions:\s*\[(.*?)\]\s*$", txt, re.M)
     if ms:
