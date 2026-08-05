@@ -1,0 +1,8 @@
+# 로컬 상태 — 추적하지 않음
+*.log
+*.db
+*.db-wal
+*.db-shm
+*.bak-*
+.sessionlog.lock
+__pycache__/
