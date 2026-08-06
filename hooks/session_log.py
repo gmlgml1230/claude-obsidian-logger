@@ -49,6 +49,9 @@ CLAUDE_TIMEOUT_SEC = 300
 MIN_USER_CHARS = 12
 MIN_TOTAL_CHARS = 60
 EXCLUDE_MARKERS = ("#nolog", "#기록제외", "#skiplog")   # 세션 증분 전체 제외
+# 태스크만 만들지 않는다. 기록(진행 로그·대화·주제 매칭)은 그대로 간다.
+# EXCLUDE_MARKERS 와 역할이 다르다 — 이쪽은 '한 일은 남기되 할 일은 안 만든다'.
+TASK_SKIP_MARKERS = ("#완료", "#done")
 SUMMARY_CHAR_BUDGET = 15000
 SUMMARY_TURN_MAX = 2000
 SUMMARY_MAX_TRIES = 2
@@ -337,16 +340,30 @@ def is_significant(meta):
     return real_user >= MIN_USER_CHARS and total >= MIN_TOTAL_CHARS
 
 
-def _is_excluded(meta):
+def _has_marker(meta, markers):
+    """user 발화에서 마커를 찾는다. 도구 라인은 사용자가 친 것이 아니므로 제외."""
     for role, lines, _ in meta["turns"]:
         if role != "user":
             continue
         for ln in lines:
             if ln.startswith(("← 도구", "→ 도구", "⌘ ")):
                 continue
-            if any(m in ln.lower() for m in EXCLUDE_MARKERS):
+            if any(m in ln.lower() for m in markers):
                 return True
     return False
+
+
+def _is_excluded(meta):
+    return _has_marker(meta, EXCLUDE_MARKERS)
+
+
+def _is_task_skipped(meta):
+    """'#완료' — 태스크만 만들지 않는다.
+
+    판정을 LLM 에게 묻지 않는 이유는 아래 주석과 같다(비결정적).
+    #nolog 와 달리 기록은 그대로 남는다 — 한 일은 남기되 할 일만 안 만든다.
+    """
+    return _has_marker(meta, TASK_SKIP_MARKERS)
 
 
 # 기록 여부는 기계 게이트(is_significant)만으로 결정한다.
@@ -468,6 +485,8 @@ def build_summary_prompt(meta, current_tasks, choices=()):
   · **주제의 다음 단계는 resume 에만 쓴다.** 순서가 있고 서로 의존하는 단계를 태스크로 쪼개지 마라.
   · 태스크로 만들 것은 셋뿐이다 — ① 주제 밖 단발 작업, ② 주제 안이지만 순서 밖이라 잊기 쉬운 일,
     ③ 완료 날짜를 남겨야 하는 일. 셋 중 어느 것도 아니면 만들지 마라.
+  · **topic 이 "none" 이면 남은 일을 반드시 태스크로 남겨라(= ①).** 주제가 없으면 resume 은
+    세션 노트에만 적히고 목차에는 실리지 않아, 태스크로 남기지 않으면 어디에서도 보이지 않는다.
   · 기존 항목 보존, 관련 작업은 하나로 묶기(과도 분할 금지), 새 작업은 관련끼리 묶어 추가.
   · 완료 판정·삭제·체크(- [x]) 변경 금지(완료는 사용자가 직접). 기존 `[[...]]` 링크 보존, 새 링크 만들지 마라.
 - conclusions: **다음에 같은 작업을 할 때 몰랐으면 헤맬 사실**만 배열로. 수치·조건·이유를 담아라.
@@ -1202,6 +1221,9 @@ def _process(transcript, base=None, db_path=DB_FILE, use_llm=True):
                 db_set_processed(sid, len(all_turns), db_path)
                 _debug("[worker] SKIP: 새 turn 사소 (마커만 전진)")
                 return
+            task_skip = _is_task_skipped(new_meta)
+            if task_skip:
+                _debug("[worker] '#완료' 마커 — 기록은 남기고 태스크만 만들지 않음")
 
             start = _fmt_ts(meta["first_ts"])
             started = start.strftime("%Y-%m-%d") if start else datetime.now().strftime("%Y-%m-%d")
@@ -1242,8 +1264,11 @@ def _process(transcript, base=None, db_path=DB_FILE, use_llm=True):
                 # 날짜별 결과를 이어받는다. 마지막 요약만 쓰면 중간 날짜에서 나온 태스크가
                 # 통째로 사라진다 — 다중 활동일 flush 는 실측 42%(19건 중 8건)다.
                 # 태그도 여기서 붙인다(날짜마다 topic 이 다를 수 있다).
-                open_cur = _tag_topic(_split_tasks(summary["tasks_markdown"])[0],
-                                      topic if on_topic else None)
+                # '#완료' 면 open_cur 를 그대로 둔다 — 기존 목록이 다시 쓰이므로 신규가 안 생긴다.
+                # (_update_tasks 는 계속 호출된다. 완료 전이·아카이브·완료일 스탬프는 그쪽 몫이다.)
+                if not task_skip:
+                    open_cur = _tag_topic(_split_tasks(summary["tasks_markdown"])[0],
+                                          topic if on_topic else None)
                 _debug(f"[worker] {date}: topic={topic or 'none'} 진행 로그·대화·데일리 기록")
 
             new_blocks.reverse()  # 최신이 위로
