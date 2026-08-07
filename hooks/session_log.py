@@ -718,17 +718,24 @@ def _archive_done(base, lines):
             f.write(l.rstrip() + "\n")
 
 
-def _link_tasks(lines, conv_link, topic=None):
-    """새 태스크에 주제 태그와 대화 링크를 붙인다.
-    주제 귀속은 태스크가 **생길 때**만 확실히 아는 정보다 — 나중에 텍스트 유사도로
-    추정하면 세션마다 답이 흔들린다. 이미 링크가 있는 줄은 다른 세션에서 온
-    기존 태스크이므로 이번 주제를 덧씌우지 않는다."""
+def _link_tasks(lines, conv_link, topic=None, prev_keys=None):
+    """새로 생긴 태스크에만 주제 태그와 대화 링크를 붙인다.
+
+    '링크가 없으면 새 것'으로 판정하면 안 된다 — 사람이 손으로 넣은 태스크에는 링크가 없어서
+    다음 flush 가 무관한 세션의 대화를 일괄로 붙여버린다(실제 발생: 23건이 한 대화로 몰림).
+    **직전 목록에 없던 키**만 새 것이다."""
+    def is_new(line):
+        if prev_keys is None:
+            return "[[" not in line          # 폴백(직전 목록을 못 구한 경우)
+        return _task_key(line) not in prev_keys
+
     out = []
     for s in lines:
         s = s.rstrip()
-        if topic and "[[" not in s:
+        fresh = is_new(s)
+        if topic and fresh and f"[[{TOPICS_DIRNAME}/" not in s:
             s = f"{s}  [[{TOPICS_DIRNAME}/{topic}|🔧]]"
-        if conv_link and "↗ 대화]]" not in s and "↗ 세션]]" not in s:
+        if conv_link and fresh and "↗ 대화]]" not in s and "↗ 세션]]" not in s:
             s = f"{s}  [[{conv_link}|↗ 대화]]"
         out.append(s)
     return out
@@ -817,15 +824,17 @@ def _update_tasks(base, tasks_markdown, done_cur, conv_link, db_path=DB_FILE, to
     # 락을 쥔 채 LLM 을 기다리는 37~91초 사이에 사람이 체크한 항목이 있으면,
     # 옛 스냅샷으로 덮어쓸 때 그 체크가 조용히 되돌려진다.
     tf_now = os.path.join(base, INDEX_FILENAME)
+    prev_open = []
     if os.path.exists(tf_now):
         with open(tf_now, encoding="utf-8") as f:
-            _, done_cur = _split_tasks(f.read())
+            prev_open, done_cur = _split_tasks(f.read())
+    prev_keys = {_task_key(l) for l in prev_open} | {_task_key(l) for l in done_cur}
     today = datetime.now().strftime("%Y-%m-%d")
     open_new, _ = _split_tasks(tasks_markdown or "")
     done_keys = {_task_key(d) for d in done_cur}
     open_new = [o for o in open_new if _task_key(o) not in done_keys]
     open_new = _restore_task_topics(open_new, base)
-    open_new = _link_tasks(open_new, conv_link, topic)
+    open_new = _link_tasks(open_new, conv_link, topic, prev_keys)
     # 번호는 렌더 순번이라 완료 시점에 뗀다 (아카이브까지 그대로 간다)
     done_stamped = [_stamp_done(_numbered(d, None), _completion_date(_task_key(d), today, db_path))
                     for d in done_cur]
