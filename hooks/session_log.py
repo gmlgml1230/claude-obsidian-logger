@@ -37,9 +37,9 @@ from datetime import datetime, timedelta
 VAULT = os.environ.get("OBSIDIAN_VAULT") or os.path.expanduser("~/Documents/Obsidian")
 SUMMARY_MODEL = os.environ.get("SESSIONLOG_MODEL", "claude-sonnet-4-6")
 INDEX_FILENAME = os.environ.get("SESSIONLOG_INDEX_FILE", "INDEX.md")
-TASKS_DONE_HEADER = "## ✅ 완료"
 DONE_RETAIN_DAYS = 14
 ARCHIVE_FILENAME = "완료 아카이브.md"
+TASKS_DONE_HEADER = f"## ✅ 완료 ({DONE_RETAIN_DAYS // 7}주 보관)"
 GUARD_ENV = "CLAUDE_SESSIONLOG_RUNNING"
 
 MAX_TOOL_RESULT_CHARS = 280
@@ -383,12 +383,6 @@ def _turn_date(ts, fallback):
     return d.strftime("%Y-%m-%d") if d else fallback
 
 
-def _slug(title):
-    s = (title or "untitled").strip().lower()
-    s = re.sub(r"[^\w가-힣]+", "-", s).strip("-")
-    return s[:50] or "untitled"
-
-
 def _yaml_val(v):
     return '"' + str(v).replace("\n", " ").replace('"', "'") + '"'
 
@@ -714,12 +708,14 @@ def _restore_task_topics(open_lines, base):
 
 
 def _count_tasks(md):
-    return sum(1 for ln in (md or "").splitlines()
-               if ln.lstrip().lower().startswith(("- [ ]", "- [x]")))
+    """와이프 방지용 개수. **주제 줄은 세지 않는다** — 주제가 남아 있으면
+    태스크가 전부 사라져도 0 이 아니게 되어 방지가 무력해진다."""
+    o, d = _split_tasks(md)
+    return len(o) + len(d)
 
 
-def _backup_tasks(tasks_path, content):
-    d = os.path.join(os.path.dirname(tasks_path), ".task-backups")
+def _backup_tasks(path, content):
+    d = os.path.join(os.path.dirname(path), ".task-backups")
     os.makedirs(d, exist_ok=True)
     ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     with open(os.path.join(d, f"tasks_{ts}.md"), "w", encoding="utf-8") as f:
@@ -772,7 +768,9 @@ def _update_tasks(base, tasks_markdown, done_cur, conv_link, db_path=DB_FILE, to
     open_new = [o for o in open_new if _task_key(o) not in done_keys]
     open_new = _restore_task_topics(open_new, base)
     open_new = _link_tasks(open_new, conv_link, topic)
-    done_stamped = [_stamp_done(d, _completion_date(_task_key(d), today, db_path)) for d in done_cur]
+    # 번호는 렌더 순번이라 완료 시점에 뗀다 (아카이브까지 그대로 간다)
+    done_stamped = [_stamp_done(_numbered(d, None), _completion_date(_task_key(d), today, db_path))
+                    for d in done_cur]
     cutoff = (datetime.now() - timedelta(days=DONE_RETAIN_DAYS)).strftime("%Y-%m-%d")
     recent, old = [], []
     for d in done_stamped:
@@ -1076,18 +1074,6 @@ def _topic_order(base):
     return entries
 
 
-def _task_title(line):
-    """INDEX 표시용 짧은 제목. 상세는 작업현황.md 가 정본이므로 여기선 잘라도 된다
-    (한 줄이 300자를 넘는 태스크가 있어, 그대로 실으면 목차가 목차 구실을 못 한다)."""
-    s = re.sub(r"^\s*-\s*\[[ xX]\]\s*", "", line)
-    s = re.sub(r"^\*\*\d+-\d+\*\*\s*", "", s)   # 저장된 번호는 걷어낸다(렌더에서 다시 붙인다)
-    s = re.sub(r"\[\[.*?\]\]", "", s).strip()
-    head = s.split(": ", 1)[0].strip()
-    if len(head) >= 5:            # 'A: B' 형태면 A 가 제목이다. 너무 짧으면 오탐
-        s = head
-    return s if len(s) <= TASK_TITLE_MAX else s[:TASK_TITLE_MAX].rstrip() + "…"
-
-
 def _open_tasks_by_topic(base, open_lines=None):
     """미완료 태스크를 주제별로 나눈다 → ({slug: [원문 줄]}, [무소속 줄]).
     open_lines 가 없으면 INDEX 자신에서 읽는다(사람이 체크만 한 경우)."""
@@ -1143,8 +1129,9 @@ def _write_index(base, open_lines=None, done_lines=None):
         out += ["", "## ☑️ 기타 태스크", ""] + [_numbered(l, None) for l in orphan]
     if paused:  # 지금 손대지 않는 것이므로 아래로
         out += ["", "## ⏸ 보류", ""] + paused
-    out += ["", TASKS_DONE_HEADER, ""]
-    out += list(done_lines) if done_lines else ["_(완료 항목 없음)_"]
+    out += ["", TASKS_DONE_HEADER, "",
+            f"> {DONE_RETAIN_DAYS}일이 지나면 [[{os.path.splitext(ARCHIVE_FILENAME)[0]}]] 로 옮겨집니다.", ""]
+    out += [_numbered(l, None) for l in done_lines] if done_lines else ["_(완료 항목 없음)_"]
     _safe_write_index(path, "\n".join(out).rstrip() + "\n")
 
 
