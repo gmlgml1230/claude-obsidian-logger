@@ -89,6 +89,15 @@ DROPPED_HEADER = "## ❌ 접은 안"
 
 
 # ── 디버그 로그 ─────────────────────────────────────────────────────
+def _atomic_write(path, text):
+    """tmp 에 쓰고 rename. 도중에 죽어도 원본이 잘린 채 남지 않는다.
+    topics/ 는 자체 백업이 없어(태스크 백업은 INDEX 전용) 손상되면 git 뿐이다."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
 def _debug(msg):
     try:
         now = datetime.now()
@@ -135,6 +144,33 @@ def db_set_processed(sid, n, db_path=DB_FILE):
                       "ON CONFLICT(session_id) DO UPDATE SET processed_turns=?", (sid, n, n))
     except Exception as e:
         _debug("db_set ERROR: " + repr(e))
+
+
+def _db_usage(db_path):
+    c = _db(db_path)
+    c.execute("CREATE TABLE IF NOT EXISTS llm_usage ("
+              "ts TEXT, session_id TEXT, date TEXT, topic TEXT, model TEXT,"
+              "prompt_chars INT, conv_chars INT, tasks_chars INT, topics_chars INT, instr_chars INT,"
+              "input_tokens INT, output_tokens INT, cache_read INT, cache_write INT,"
+              "cost_usd REAL, elapsed_ms INT)")
+    return c
+
+
+def _log_usage(db_path, sid, date, topic, parts, usage):
+    """콜 1회의 비용과 프롬프트 구성을 남긴다. 실패해도 본 작업을 막지 않는다."""
+    if not usage:
+        return
+    try:
+        with _db_usage(db_path) as c:
+            c.execute("INSERT INTO llm_usage VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+                datetime.now().isoformat(timespec="seconds"), sid, date, topic or "none", SUMMARY_MODEL,
+                parts.get("prompt_chars"), parts.get("conv_chars"), parts.get("tasks_chars"),
+                parts.get("topics_chars"), parts.get("instr_chars"),
+                usage.get("input_tokens"), usage.get("output_tokens"),
+                usage.get("cache_read"), usage.get("cache_write"),
+                usage.get("cost_usd"), usage.get("elapsed_ms")))
+    except Exception as e:
+        _debug("usage 기록 실패: " + repr(e))
 
 
 def _db_tasks(db_path):
@@ -488,7 +524,7 @@ def build_summary_prompt(meta, current_tasks, choices=()):
   · 기각 이유가 없으면 넣지 마라. 없으면 [].
 
 모든 답변 한국어. 확실치 않으면 짧게."""
-    return (
+    prompt = (
         f"{instructions}\n\n"
         "반드시 아래 JSON 하나로만 답하라. 코드펜스/설명 금지. 값은 모두 문자열:\n"
         '{"topic": "slug 또는 none", "progress": "- ...", "resume": "...",\n'
@@ -498,6 +534,11 @@ def build_summary_prompt(meta, current_tasks, choices=()):
         f"# 현재 미완료 작업\n{current_tasks or '(없음)'}\n\n"
         f"# 이번에 새로 진행한 대화\n{conversation}\n"
     )
+    # 구성요소별 크기 — "무관한 태스크 목록이 비용을 얼마나 밀어올리는가" 를 나중에 따지기 위함
+    parts = {"prompt_chars": len(prompt), "conv_chars": len(conversation),
+             "tasks_chars": len(current_tasks or ""), "topics_chars": len(slug_list),
+             "instr_chars": len(instructions)}
+    return prompt, parts
 
 
 def _extract_json(text):
@@ -532,40 +573,58 @@ def _valid_summary(parsed):
 
 
 def call_claude(prompt):
+    """(응답 텍스트, usage) 를 준다. 실패하면 (None, None).
+
+    `--output-format json` 을 쓰면 total_cost_usd 와 토큰 내역이 함께 온다 —
+    프롬프트의 어느 부분이 비용을 만드는지 나중에 따지려면 이 값이 있어야 한다."""
     env = dict(os.environ)
     env[GUARD_ENV] = "1"
+    t0 = datetime.now()
     try:
         proc = subprocess.run(
-            ["claude", "-p", "--model", SUMMARY_MODEL],
+            ["claude", "-p", "--model", SUMMARY_MODEL, "--output-format", "json"],
             input=prompt, text=True, capture_output=True, env=env, timeout=CLAUDE_TIMEOUT_SEC)
     except (subprocess.TimeoutExpired, FileNotFoundError):
-        return None
-    return proc.stdout if proc.returncode == 0 else None
+        return None, None
+    if proc.returncode != 0:
+        return None, None
+    elapsed = int((datetime.now() - t0).total_seconds() * 1000)
+    try:
+        o = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return proc.stdout, None          # 구버전 CLI 호환: 평문 응답
+    u = o.get("usage") or {}
+    return o.get("result") or "", {
+        "cost_usd": o.get("total_cost_usd"),
+        "input_tokens": u.get("input_tokens"),
+        "output_tokens": u.get("output_tokens"),
+        "cache_read": u.get("cache_read_input_tokens"),
+        "cache_write": u.get("cache_creation_input_tokens"),
+        "elapsed_ms": elapsed,
+    }
 
 
 def summarize(meta, current_tasks, use_llm=True, choices=()):
+    """요약 결과. **LLM 호출 자체가 실패하면 None 을 준다** — 호출자가 마커를 전진시키지
+    않고 다음 실행에 재시도하게 하기 위함이다. 오프라인에서 돌면 '(요약 실패)' 를 기록하고
+    마커까지 전진해 그 구간이 영영 요약되지 않는 사고가 난다."""
     title = meta.get("title") or "세션"
-    fallback = {
-        "topic": None,
-        "conclusions": [],
-        "dropped": [],
-        "progress": "- (요약 실패 — 대화 참조)",
-        "resume": "(요약 실패 — 수동 확인 필요)",
-        "tasks_markdown": current_tasks or "",
-    }
     if not use_llm:
-        return {**fallback, "progress": f"- [{title}] (dry-run)", "resume": "(dry-run)"}
-    base_prompt = build_summary_prompt(meta, current_tasks, choices)
+        return {"topic": None, "conclusions": [], "dropped": [],
+                "progress": f"- [{title}] (dry-run)", "resume": "(dry-run)",
+                "tasks_markdown": current_tasks or "", "_usage": None, "_parts": {}}
+    base_prompt, parts = build_summary_prompt(meta, current_tasks, choices)
     nudge = "\n\n[중요] 직전 응답이 형식에 안 맞았다. JSON 객체 하나만 출력하라."
-    valid = None
+    valid, usage = None, None
     for attempt in range(SUMMARY_MAX_TRIES):
-        out = call_claude(base_prompt if attempt == 0 else base_prompt + nudge)
+        out, usage = call_claude(base_prompt if attempt == 0 else base_prompt + nudge)
         valid = _valid_summary(_extract_json(out)) if out else None
         if valid is not None:
             break
         _debug(f"[worker] 요약 무효 — 재시도({attempt + 1})")
     if valid is None:
-        return fallback
+        _debug("[worker] 요약 실패(LLM 응답 없음/형식 불일치) — 기록하지 않는다")
+        return None
 
     # 닫힌 선택지 강제: 목록에 없는 슬러그는 none 으로 (결정 E — 훅은 새 주제를 만들지 않는다)
     topic = (valid["topic"] or "").strip()
@@ -578,9 +637,11 @@ def summarize(meta, current_tasks, use_llm=True, choices=()):
         "topic": topic,
         "conclusions": valid["conclusions"],
         "dropped": valid["dropped"],
-        "progress": valid["progress"] or fallback["progress"],
-        "resume": valid["resume"] or fallback["resume"],
+        "progress": valid["progress"] or "- (내용 없음)",
+        "resume": valid["resume"] or "(다음 미기재)",
         "tasks_markdown": valid["tasks_markdown"] or (current_tasks or ""),
+        "_usage": usage,
+        "_parts": parts,
     }
 
 
@@ -742,10 +803,7 @@ def _safe_write_index(path, new_md):
         _debug(f"[worker] 태스크 항목 감소: {cur_n}→{new_n} (직전 사본 .task-backups/)")
     if cur.strip():
         _backup_tasks(path, cur)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(new_md.rstrip() + "\n")
-    os.replace(tmp, path)
+    _atomic_write(path, new_md.rstrip() + "\n")
     return True
 
 
@@ -782,6 +840,27 @@ def _update_tasks(base, tasks_markdown, done_cur, conv_link, db_path=DB_FILE, to
     recent.sort(key=lambda x: _done_date(x) or "", reverse=True)   # 최신 완료가 위
     _write_index(base, open_new, recent)
     _sync_task_states(base, db_path)  # 쓰기 후 snapshot 갱신
+
+
+def _git_snapshot(base):
+    """vault 가 git 저장소면 이번 flush 결과를 커밋한다.
+
+    topics/ 는 자체 백업이 없어(.task-backups 는 INDEX 전용) git 이 유일한 복구 수단인데
+    수동 커밋에만 의존하면 되돌릴 지점이 드문드문해진다. 실패는 무시한다 — 기록이 우선이다."""
+    if not os.path.isdir(os.path.join(base, ".git")):
+        return
+    try:
+        st = subprocess.run(["git", "-C", base, "status", "--porcelain"],
+                            capture_output=True, text=True, timeout=30)
+        if st.returncode != 0 or not st.stdout.strip():
+            return
+        subprocess.run(["git", "-C", base, "add", "-A"], capture_output=True, timeout=60)
+        msg = f"auto: SessionEnd flush {datetime.now():%Y-%m-%d %H:%M}"
+        r = subprocess.run(["git", "-C", base, "commit", "-m", msg],
+                           capture_output=True, text=True, timeout=60)
+        _debug(f"[worker] git 스냅샷 {'완료' if r.returncode == 0 else '실패'}: {msg}")
+    except Exception as e:
+        _debug("git 스냅샷 예외: " + repr(e))
 
 
 # ── 동시성 락 ───────────────────────────────────────────────────────
@@ -895,12 +974,14 @@ def _section_items(txt, header):
     return out
 
 
+def _norm_line(s):
+    return re.sub(r"[\s`*_·,.\-—()\[\]]+", "", s).lower()
+
+
 def _dedup_against(items, existing, threshold=0.75):
     """기존 항목과 유사한 것을 걸러낸다. 요약기는 기존 목록을 못 보므로
     (topic 이 같은 콜에서 정해져 프롬프트에 미리 넣을 수 없다) 파이썬에서 막는다."""
-    def norm(s):
-        return re.sub(r"[\s`*_·,.\-—()\[\]]+", "", s).lower()
-
+    norm = _norm_line
     out, seen = [], [norm(e) for e in existing]
     for it in items:
         n = norm(it)
@@ -1003,9 +1084,26 @@ def _append_topic(base, slug, date, sid8, progress, next_step,
             _debug(f"[worker] topics/{slug}: {header} +{len(fresh)}건")
 
     # ② 진행 로그 — 같은 (날짜, 세션) 블록이 이미 있으면 이 단계만 건너뛴다.
+    # 같은 (날짜, 세션) 블록이 이미 있으면 **그 블록 끝에 이어붙인다.**
+    # 건너뛰면 하루에 두 번 flush 될 때(자정 자동 flush → 그날 세션 종료) 뒤쪽 진행이 유실된다.
     marker = f"### {date}  [[{CONV_DIRNAME}/{sid8}_{date}"
-    if marker in txt:
-        _debug(f"[worker] topics/{slug}: {date}/{sid8} 진행 로그 블록 이미 존재 — 건너뜀")
+    i0 = txt.find(marker)
+    if i0 != -1:
+        j0 = txt.find("\n### ", i0 + 1)
+        blk_end = j0 if j0 != -1 else len(txt.rstrip())
+        # 진행 로그는 **완전 일치**만 중복으로 본다. 유사도(0.75)를 쓰면
+        # "오전 작업"/"오후 작업" 처럼 짧고 다른 줄이 오탐으로 사라진다 — 유실보다 중복이 낫다.
+        have = {_norm_line(l.strip().lstrip("-").strip())
+                for l in txt[i0:blk_end].splitlines() if l.strip().startswith("-")}
+        fresh = [x for x in (l.strip().lstrip("-").strip()
+                             for l in progress.splitlines() if l.strip().startswith("-"))
+                 if x and _norm_line(x) not in have]
+        if fresh:
+            add = "\n" + "\n".join(f"- {x}" for x in fresh)
+            txt = txt[:blk_end] + add + txt[blk_end:]
+            _debug(f"[worker] topics/{slug}: {date}/{sid8} 블록에 +{len(fresh)}줄 이어붙임")
+        else:
+            _debug(f"[worker] topics/{slug}: {date}/{sid8} 새 진행 없음")
     else:
         block = f"{marker}|💬 대화]]\n{progress.rstrip()}"
         i = txt.find(PROGRESS_HEADER)
@@ -1028,8 +1126,7 @@ def _append_topic(base, slug, date, sid8, progress, next_step,
             tail = txt[k:].lstrip("\n") if k != -1 else ""
             body = f"{NEXT_HEADER}\n\n- {next_step.strip()}\n"
             txt = txt[:j] + body + (f"\n{tail}" if tail else "")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(txt.rstrip() + "\n")
+    _atomic_write(path, txt.rstrip() + "\n")
     return True
 
 
@@ -1055,8 +1152,7 @@ def _sync_topic_status(base):
             continue
         txt = _fm_set(txt, "status", "done")
         txt = _fm_set(txt, "updated", datetime.now().strftime("%Y-%m-%d"))
-        with open(tp, "w", encoding="utf-8") as f:
-            f.write(txt)
+        _atomic_write(tp, txt)
         _debug(f"[worker] topics/{m.group(3)}: status → done (INDEX 체크)")
 
 
@@ -1230,9 +1326,15 @@ def _process(transcript, base=None, db_path=DB_FILE, use_llm=True):
             choices = _topic_choices(base)   # (slug, title) 닫힌 선택지
             groups = _group_by_date(new_turns, started)
             last_summary, last_conv = None, None
+            processed_upto, done_groups = processed, 0
             for date, dturns in groups:
                 dmeta = {**meta, "turns": dturns}
                 summary = summarize(dmeta, "\n".join(open_cur), use_llm=use_llm, choices=choices)
+                if summary is None:
+                    # LLM 호출 실패(오프라인·타임아웃 등). 여기서 멈추고 **마커를 전진시키지 않는다** —
+                    # 그래야 다음 실행(자정 flush 등)이 이 구간을 다시 요약한다.
+                    _debug(f"[worker] {date}: 요약 실패 — 여기서 중단, 다음 실행에서 재시도")
+                    break
                 last_summary = summary
                 prog = summary["progress"].rstrip()
                 topic = summary.get("topic")
@@ -1246,19 +1348,26 @@ def _process(transcript, base=None, db_path=DB_FILE, use_llm=True):
                 _append_daily(base, date, topic if on_topic else project,
                               summary["progress"],
                               f"{TOPICS_DIRNAME}/{topic}" if on_topic else last_conv)
+                _log_usage(db_path, sid, date, topic, summary.get("_parts") or {}, summary.get("_usage"))
                 # 날짜별 결과를 이어받는다. 마지막 요약만 쓰면 중간 날짜에서 나온 태스크가
                 # 통째로 사라진다 — 다중 활동일 flush 는 실측 42%(19건 중 8건)다.
                 # '#완료' 면 open_cur 를 그대로 둔다 — 기존 목록이 다시 쓰여 신규가 안 생긴다.
                 if not task_skip:
                     open_cur = _tag_topic(_split_tasks(summary["tasks_markdown"])[0],
                                           topic if on_topic else None)
+                processed_upto += len(dturns)
+                done_groups += 1
                 _debug(f"[worker] {date}: topic={topic or 'none'} 진행 로그·대화·데일리 기록")
+
+            if done_groups == 0:
+                _debug("[worker] ABORT: 한 그룹도 처리 못 함 — 마커 유지")
+                return
 
             _update_tasks(base, "\n".join(open_cur), done_cur, last_conv, db_path,
                           last_summary.get("topic"))
             # 이번 flush가 건드린 모든 주차 + 이번 주를 재생성 (주 경계 넘김 대응)
             weeks = {}
-            for date, _ in groups:
+            for date, _ in groups[:done_groups]:
                 try:
                     dd = datetime.strptime(date, "%Y-%m-%d")
                 except ValueError:
@@ -1268,8 +1377,9 @@ def _process(transcript, base=None, db_path=DB_FILE, use_llm=True):
             weeks[(now.isocalendar()[0], now.isocalendar()[1])] = now
             for dd in weeks.values():
                 _write_weekly_digest(base, dd)
-            db_set_processed(sid, len(all_turns), db_path)
-            _debug(f"[worker] DONE: +{len(new_turns)}turn, {len(groups)}일")
+            db_set_processed(sid, processed_upto, db_path)
+            _git_snapshot(base)
+            _debug(f"[worker] DONE: +{processed_upto - processed}turn, {done_groups}/{len(groups)}일")
     except Exception as e:
         import traceback
         _debug("[worker] ERROR: " + repr(e) + "\n" + traceback.format_exc())
@@ -1289,6 +1399,24 @@ def _run_dry(use_llm):
         print("  ", os.path.relpath(p, out))
 
 
+CATCHUP_DAYS = int(os.environ.get("SESSIONLOG_CATCHUP_DAYS", "3"))
+
+
+def _catchup():
+    """열려 있는(=최근 수정된) 세션들을 SessionEnd 와 똑같이 기록한다. 세션 자체는 건드리지 않는다.
+
+    증분 마커가 있어 이미 처리된 세션은 즉시 스킵되므로 '열림' 여부를 정확히 가릴 필요가 없다.
+    LLM 호출이 실패하면 _process 가 마커를 전진시키지 않으므로 다음 실행이 그대로 재시도한다."""
+    cutoff = datetime.now().timestamp() - CATCHUP_DAYS * 86400
+    root = os.path.expanduser("~/.claude/projects")
+    files = [f for f in glob.glob(os.path.join(root, "*", "*.jsonl"))
+             if os.path.getmtime(f) >= cutoff]
+    _debug(f"[catchup] 대상 {len(files)}개 (최근 {CATCHUP_DAYS}일)")
+    for f in sorted(files, key=os.path.getmtime):
+        _process(f)
+    _debug("[catchup] 완료")
+
+
 def _dispatch_worker(transcript):
     try:
         subprocess.Popen(
@@ -1305,6 +1433,8 @@ def main():
         return _run_dry(use_llm=True)
     if "--dry-run" in sys.argv:
         return _run_dry(use_llm=False)
+    if "--catchup" in sys.argv:   # launchd 자정 실행: 열린 세션도 기록
+        return _catchup()
     if "--worker" in sys.argv:
         return _process(sys.argv[sys.argv.index("--worker") + 1])
     if "--filechanged" in sys.argv:  # INDEX 외부 편집 감지 → 완료 전이 기록 + 즉시 재렌더
