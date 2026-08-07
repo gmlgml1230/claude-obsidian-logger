@@ -592,9 +592,12 @@ def summarize(meta, current_tasks, use_llm=True, choices=()):
 
 # ── 태스크 (작업현황) ───────────────────────────────────────────────
 def _split_tasks(md):
+    """미완료/완료 태스크. 주제 줄(**3.**)은 체크박스를 갖지만 태스크가 아니므로 뺀다."""
     open_t, done_t = [], []
     for ln in (md or "").splitlines():
         s = ln.rstrip()
+        if TOPIC_LINE_RE.match(s):
+            continue
         low = s.lstrip().lower()
         if low.startswith("- [ ]"):
             open_t.append(s)
@@ -609,6 +612,10 @@ def _stamp_done(line, date_str):
 
 # 앞의 들여쓰기까지 흡수한다 — 렌더가 매번 탭을 새로 붙이므로 여기서 정규화하지 않으면
 # 재렌더마다 탭이 누적되고 번호 패턴이 매칭되지 않는다.
+# 주제 줄: - [ ] **3.** [[topics/slug|제목]] …   (태스크는 **3-1** 이라 겹치지 않는다)
+TOPIC_LINE_RE = re.compile(
+    r"^\s*-\s*\[([ xX])\]\s*\*\*(\d+)\.\*\*\s*\[\[" + re.escape(TOPICS_DIRNAME) + r"/([^\]|]+)")
+
 NUM_RE = re.compile(r"^\s*(-\s*\[[ xX]\]\s*)(?:\*\*[0-9]+-[0-9]+\*\*\s*)?(.*)$")
 
 
@@ -781,16 +788,26 @@ def _update_tasks(base, tasks_markdown, done_cur, conv_link, db_path=DB_FILE, to
 
 # ── 동시성 락 ───────────────────────────────────────────────────────
 @contextlib.contextmanager
-def _vault_lock():
+def _vault_lock(blocking=True):
+    """blocking=False 면 잡히지 않을 때 곧바로 False 를 준다.
+    FileChanged 는 사람이 체크한 직후 도는 훅이라 워커의 LLM 대기(최대 90초)를
+    기다리면 안 된다 — 못 잡으면 건너뛰고, 어차피 그 워커가 끝나며 다시 렌더한다."""
     f = open(LOCK_FILE, "w")
+    got = False
     try:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-        yield
-    finally:
         try:
-            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-        finally:
-            f.close()
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB)
+            got = True
+        except OSError:
+            got = False
+        yield got
+    finally:
+        if got:
+            try:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        f.close()
 
 
 # ── 증분 렌더링 (허브 / 대화 페이지 / daily / weekly) ────────────────
@@ -1018,6 +1035,33 @@ def _append_topic(base, slug, date, sid8, progress, next_step,
     return True
 
 
+def _sync_topic_status(base):
+    """INDEX 에서 체크된 주제를 `topics/<slug>.md` 의 status: done 으로 반영한다.
+    주제를 닫는 것도 목차에서 할 수 있어야 한다 — 안 그러면 태스크가 0이 된 주제가
+    '끝난 것'인지 '아직 안 쪼갠 것'인지 목차만 봐서는 알 수 없다."""
+    p = os.path.join(base, INDEX_FILENAME)
+    if not os.path.exists(p):
+        return
+    with open(p, encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    for ln in lines:
+        m = TOPIC_LINE_RE.match(ln)
+        if not m or m.group(1).lower() != "x":
+            continue
+        tp = os.path.join(base, TOPICS_DIRNAME, f"{m.group(3)}.md")
+        if not os.path.exists(tp):
+            continue
+        with open(tp, encoding="utf-8") as f:
+            txt = f.read()
+        if re.search(r"^status:\s*done\s*$", txt, re.M):
+            continue
+        txt = _fm_set(txt, "status", "done")
+        txt = _fm_set(txt, "updated", datetime.now().strftime("%Y-%m-%d"))
+        with open(tp, "w", encoding="utf-8") as f:
+            f.write(txt)
+        _debug(f"[worker] topics/{m.group(3)}: status → done (INDEX 체크)")
+
+
 def _topic_order(base):
     """진행 중 주제를 표시 순서대로. INDEX 와 작업현황이 **같은 번호**를 쓰게 하려면
     순서를 한 곳에서 정해야 한다. 두 파일이 다른 순서를 내면 5-2 를 보고 찾아갈 수 없다."""
@@ -1065,6 +1109,7 @@ def _write_index(base, open_lines=None, done_lines=None):
     d = os.path.join(base, TOPICS_DIRNAME)
     os.makedirs(d, exist_ok=True)
     path = os.path.join(base, INDEX_FILENAME)
+    _sync_topic_status(base)   # 체크된 주제는 목록에서 빠지도록 먼저 반영
     if open_lines is None or done_lines is None:
         cur = open(path, encoding="utf-8").read() if os.path.exists(path) else ""
         o, dn = _split_tasks(cur)
@@ -1073,12 +1118,13 @@ def _write_index(base, open_lines=None, done_lines=None):
 
     by_topic, orphan = _open_tasks_by_topic(base, open_lines)
     out = ["# 🧭 INDEX", "",
-           "> 주제·할 일 목차. **체크박스만 직접 건드리세요** — 나머지는 세션 종료 시 다시 씁니다.", "",
+           "> 주제·할 일 목차. **체크박스만 직접 건드리세요** — 나머지는 세션 종료 시 다시 씁니다.",
+           "> 주제를 체크하면 그 주제가 닫히고(`status: done`) 목록에서 빠집니다.", "",
            "## 🔧 진행 중인 주제", ""]
     active, paused = [], []
     for n, (slug, m, st) in enumerate(_topic_order(base), 1):
         mine = by_topic.pop(slug, [])
-        line = f"- **{n}.** [[{TOPICS_DIRNAME}/{slug}|{m.get('title') or slug}]] `{st}`"
+        line = f"- [ ] **{n}.** [[{TOPICS_DIRNAME}/{slug}|{m.get('title') or slug}]] `{st}`"
         # 태스크가 있으면 그것이 곧 '다음'이다. 🔜 다음 을 함께 실으면 같은 말이 두 번 나온다.
         line += f" · 남은 일 {len(mine)}" if mine else f" — {m.get('next') or '_(다음 미기재)_'}"
         # 설계 문서 포인터는 **지시문**으로 둔다. "그쪽에 있다"로 끝나는 서술문은
@@ -1274,12 +1320,18 @@ def main():
         return _run_dry(use_llm=False)
     if "--worker" in sys.argv:
         return _process(sys.argv[sys.argv.index("--worker") + 1])
-    if "--filechanged" in sys.argv:  # 작업현황 외부 편집 감지 → 완료 전이 기록
+    if "--filechanged" in sys.argv:  # INDEX 외부 편집 감지 → 완료 전이 기록 + 즉시 재렌더
         try:
             sys.stdin.read()
         except Exception:
             pass
-        return _sync_task_states(VAULT)
+        _sync_task_states(VAULT)
+        with _vault_lock(blocking=False) as got:
+            if got:
+                _write_index(VAULT)   # 체크한 항목이 바로 완료 섹션으로 내려간다
+            else:
+                _debug("[filechanged] 워커가 락 보유 — 재렌더는 그쪽에 맡김")
+        return
 
     if os.environ.get(GUARD_ENV):
         return
