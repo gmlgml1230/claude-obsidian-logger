@@ -36,8 +36,7 @@ from datetime import datetime, timedelta
 # ── 설정값 ──────────────────────────────────────────────────────────
 VAULT = os.environ.get("OBSIDIAN_VAULT") or os.path.expanduser("~/Documents/Obsidian")
 SUMMARY_MODEL = os.environ.get("SESSIONLOG_MODEL", "claude-sonnet-4-6")
-TASKS_FILENAME = os.environ.get("SESSIONLOG_TASKS_FILE", "📌 작업현황.md")
-TASKS_OPEN_HEADER = "## ☑️ 미완료 태스크"
+INDEX_FILENAME = os.environ.get("SESSIONLOG_INDEX_FILE", "INDEX.md")
 TASKS_DONE_HEADER = "## ✅ 완료"
 DONE_RETAIN_DAYS = 14
 ARCHIVE_FILENAME = "완료 아카이브.md"
@@ -84,7 +83,6 @@ NEXT_HEADER = "## 🔜 다음"
 
 # ── 주제축 (topics/) ────────────────────────────────────────────────
 TOPICS_DIRNAME = "topics"
-INDEX_FILENAME = "INDEX.md"
 TASK_TITLE_MAX = 80
 CONCLUSION_HEADER = "## 📌 결론"
 DROPPED_HEADER = "## ❌ 접은 안"
@@ -161,7 +159,7 @@ def _task_states(md):
 def _sync_task_states(base, db_path=DB_FILE):
     """작업현황 현재 상태 vs snapshot diff → open→done 전이를 그 시각으로 task_events에 기록.
     FileChanged hook(외부 편집 즉시) + SessionEnd(폴백) 양쪽에서 호출."""
-    tf = os.path.join(base, TASKS_FILENAME)
+    tf = os.path.join(base, INDEX_FILENAME)
     if not os.path.exists(tf):
         return
     cur = _task_states(open(tf, encoding="utf-8").read())
@@ -609,40 +607,18 @@ def _stamp_done(line, date_str):
     return line if "✅" in line else f"{line} ✅ {date_str}"
 
 
-def _compose_tasks(open_lines, done_lines, base=None):
-    """미완료는 **INDEX 와 같은 그룹·같은 번호**로 묶어 쓴다.
-    두 파일의 형태가 다르면 INDEX 에서 본 5-2 를 여기서 찾을 수 없다.
-    완료는 시간순이 자연스러우므로 묶지 않는다."""
-    parts = [TASKS_OPEN_HEADER, ""]
-    if not open_lines:
-        parts += ["_(미완료 태스크 없음)_"]
-    elif base is None:
-        parts += open_lines                      # 그룹 정보를 못 구하면 평면
-    else:
-        rest = list(open_lines)
-        for n, (slug, m, _st) in enumerate(_topic_order(base), 1):
-            mine = [l for l in rest if _task_topic(l) == slug]
-            if not mine:
-                continue
-            rest = [l for l in rest if l not in mine]
-            parts += [f"### {n}. {m.get('title') or slug}", ""]
-            for j, l in enumerate(mine, 1):
-                parts.append(_numbered(l, f"{n}-{j}"))
-            parts.append("")
-        if rest:
-            parts += ["### 기타", ""] + rest + [""]
-    parts += ["", TASKS_DONE_HEADER, ""]
-    parts += list(reversed(done_lines)) if done_lines else ["_(완료 항목 없음)_"]
-    return "\n".join(parts).rstrip() + "\n"
-
-
-NUM_RE = re.compile(r"^(-\s*\[[ xX]\]\s*)(?:\*\*[0-9]+-[0-9]+\*\*\s*)?(.*)$")
+# 앞의 들여쓰기까지 흡수한다 — 렌더가 매번 탭을 새로 붙이므로 여기서 정규화하지 않으면
+# 재렌더마다 탭이 누적되고 번호 패턴이 매칭되지 않는다.
+NUM_RE = re.compile(r"^\s*(-\s*\[[ xX]\]\s*)(?:\*\*[0-9]+-[0-9]+\*\*\s*)?(.*)$")
 
 
 def _numbered(line, num):
-    """줄에 **n-j** 번호를 붙인다(이미 있으면 갈아끼운다). 번호는 렌더 순번이라 매번 다시 매긴다."""
+    """줄에 **n-j** 번호를 붙인다(이미 있으면 갈아끼운다). 번호는 렌더 순번이라 매번 다시 매긴다.
+    num 이 None 이면 번호를 떼기만 한다(주제 없는 태스크)."""
     m = NUM_RE.match(line)
-    return f"{m.group(1)}**{num}** {m.group(2)}" if m else line
+    if not m:
+        return line
+    return f"{m.group(1)}**{num}** {m.group(2)}" if num else f"{m.group(1)}{m.group(2)}"
 
 
 def _task_key(line):
@@ -680,21 +656,20 @@ def _archive_done(base, lines):
             f.write(l.rstrip() + "\n")
 
 
-def _link_tasks(md, hub_name, topic=None):
-    """새 태스크에 세션 링크와 주제 태그를 붙인다.
+def _link_tasks(lines, conv_link, topic=None):
+    """새 태스크에 주제 태그와 대화 링크를 붙인다.
     주제 귀속은 태스크가 **생길 때**만 확실히 아는 정보다 — 나중에 텍스트 유사도로
     추정하면 세션마다 답이 흔들린다. 이미 링크가 있는 줄은 다른 세션에서 온
     기존 태스크이므로 이번 주제를 덧씌우지 않는다."""
     out = []
-    for line in md.splitlines():
-        s = line.rstrip()
-        if s.lstrip().lower().startswith(("- [ ]", "- [x]")):
-            if topic and "[[" not in s:
-                s = f"{s}  [[{TOPICS_DIRNAME}/{topic}|🔧]]"
-            if "↗ 세션]]" not in s:
-                s = f"{s}  [[{hub_name}|↗ 세션]]"
+    for s in lines:
+        s = s.rstrip()
+        if topic and "[[" not in s:
+            s = f"{s}  [[{TOPICS_DIRNAME}/{topic}|🔧]]"
+        if conv_link and "↗ 대화]]" not in s and "↗ 세션]]" not in s:
+            s = f"{s}  [[{conv_link}|↗ 대화]]"
         out.append(s)
-    return "\n".join(out)
+    return out
 
 
 def _tag_topic(lines, topic):
@@ -715,7 +690,7 @@ def _task_topic(line):
 def _restore_task_topics(open_lines, base):
     """LLM 이 목록을 재작성하며 주제 태그를 떨어뜨려도 기존 파일에서 되살린다.
     태그가 날아가면 그룹핑이 통째로 무너지므로 링크 보존 지시에만 기대지 않는다."""
-    tf = os.path.join(base, TASKS_FILENAME)
+    tf = os.path.join(base, INDEX_FILENAME)
     if not os.path.exists(tf):
         return open_lines
     prev = {}
@@ -749,36 +724,38 @@ def _backup_tasks(tasks_path, content):
             pass
 
 
-def _safe_write_tasks(tasks_path, new_md):
+def _safe_write_index(path, new_md):
     cur = ""
-    if os.path.exists(tasks_path):
-        with open(tasks_path, encoding="utf-8") as f:
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
             cur = f.read()
     cur_n, new_n = _count_tasks(cur), _count_tasks(new_md)
     if cur_n >= 1 and new_n == 0:
-        _debug(f"[worker] 작업현황 덮어쓰기 거부(와이프 방지): {cur_n}→0")
+        _debug(f"[worker] INDEX 덮어쓰기 거부(와이프 방지): {cur_n}→0")
         return False
     if new_n < cur_n:
         # 정당한 감소(아카이브 이동·항목 병합)도 있으므로 막지는 않는다.
         # 다만 LLM 이 조용히 항목을 떨어뜨리는 경우를 사후에 알 수 있어야 한다.
-        _debug(f"[worker] 작업현황 항목 감소: {cur_n}→{new_n} (직전 사본 .task-backups/)")
+        _debug(f"[worker] 태스크 항목 감소: {cur_n}→{new_n} (직전 사본 .task-backups/)")
     if cur.strip():
-        _backup_tasks(tasks_path, cur)
-    tmp = tasks_path + ".tmp"
+        _backup_tasks(path, cur)
+    tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(new_md.rstrip() + "\n")
-    os.replace(tmp, tasks_path)
+    os.replace(tmp, path)
     return True
 
 
-def _update_tasks(base, tasks_markdown, done_cur, hub_name, db_path=DB_FILE, topic=None):
-    """LLM 미완료 결과 + 기존 완료(보존·아카이브) → 작업현황 안전 갱신.
-    완료일은 task_events의 실제 완료 시각(FileChanged로 포착) 우선."""
+def _update_tasks(base, tasks_markdown, done_cur, conv_link, db_path=DB_FILE, topic=None):
+    """미완료/완료를 정리해 INDEX 를 다시 쓴다.
+
+    태스크의 정본은 INDEX.md 하나다 — 별도 목록 파일을 두면 번호가 어긋나고
+    '체크했는데 목차엔 남아있다' 가 생긴다."""
     _sync_task_states(base, db_path)  # 폴백: 아직 미기록된 완료 전이 포착
     # done 은 호출자가 넘긴 스냅샷이 아니라 **지금 파일**에서 다시 읽는다.
     # 락을 쥔 채 LLM 을 기다리는 37~91초 사이에 사람이 체크한 항목이 있으면,
     # 옛 스냅샷으로 덮어쓸 때 그 체크가 조용히 되돌려진다.
-    tf_now = os.path.join(base, TASKS_FILENAME)
+    tf_now = os.path.join(base, INDEX_FILENAME)
     if os.path.exists(tf_now):
         with open(tf_now, encoding="utf-8") as f:
             _, done_cur = _split_tasks(f.read())
@@ -787,6 +764,7 @@ def _update_tasks(base, tasks_markdown, done_cur, hub_name, db_path=DB_FILE, top
     done_keys = {_task_key(d) for d in done_cur}
     open_new = [o for o in open_new if _task_key(o) not in done_keys]
     open_new = _restore_task_topics(open_new, base)
+    open_new = _link_tasks(open_new, conv_link, topic)
     done_stamped = [_stamp_done(d, _completion_date(_task_key(d), today, db_path)) for d in done_cur]
     cutoff = (datetime.now() - timedelta(days=DONE_RETAIN_DAYS)).strftime("%Y-%m-%d")
     recent, old = [], []
@@ -796,8 +774,8 @@ def _update_tasks(base, tasks_markdown, done_cur, hub_name, db_path=DB_FILE, top
     if old:
         _archive_done(base, old)
         _debug(f"[worker] 완료 아카이브 이동: {len(old)}건")
-    composed = _link_tasks(_compose_tasks(open_new, recent, base), hub_name, topic)
-    _safe_write_tasks(os.path.join(base, TASKS_FILENAME), composed)
+    recent.sort(key=lambda x: _done_date(x) or "", reverse=True)   # 최신 완료가 위
+    _write_index(base, open_new, recent)
     _sync_task_states(base, db_path)  # 쓰기 후 snapshot 갱신
 
 
@@ -843,7 +821,9 @@ def _render_turns(turns):
     return "\n".join(out).rstrip() + "\n"
 
 
-def _write_conversation_page(base, sid8, date, hub_name, turns, topic=None):
+def _write_conversation_page(base, sid8, date, turns, title=None, progress=None, topic=None):
+    """그날 대화 원문. 세션 허브를 두지 않으므로 진행 요약도 여기 얹는다
+    (주제가 잡힌 세션은 topics/ 가 정본이고, 여기 요약은 대화를 여는 사람용 머리말)."""
     d = os.path.join(base, CONV_DIRNAME)
     os.makedirs(d, exist_ok=True)
     path = os.path.join(d, f"{sid8}_{date}.md")
@@ -851,12 +831,17 @@ def _write_conversation_page(base, sid8, date, hub_name, turns, topic=None):
     if os.path.exists(path):
         with open(path, "a", encoding="utf-8") as f:
             f.write("\n" + body)
-    else:
-        # title frontmatter: Front Matter Title 플러그인이 파일명 대신 표시
-        title = f"{topic or '대화'} · {date}"
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(f"---\ntitle: {_yaml_val(title)}\ntopic: {_yaml_val(title)}\n---\n\n"
-                    f"> ↑ 프로젝트: [[{hub_name}]]\n\n# 💬 {date} 대화\n\n" + body)
+        return
+    # title frontmatter: Front Matter Title 플러그인이 파일명 대신 표시
+    disp = f"{title or topic or '대화'} · {date}"
+    head = f"---\ntitle: {_yaml_val(disp)}\n---\n\n"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(head)
+        if topic:
+            f.write(f"> 주제: [[{TOPICS_DIRNAME}/{topic}]]\n\n")
+        if progress:
+            f.write(f"## 📈 이날 진행\n\n{progress.rstrip()}\n\n")
+        f.write(f"# 💬 {date} 대화\n\n" + body)
 
 
 def _append_daily(base, date, label, progress, link_target):
@@ -869,66 +854,6 @@ def _append_daily(base, date, label, progress, link_target):
     line = f"- [{label}] {first}  [[{link_target}|↗]]"
     with open(os.path.join(d, f"{date}.md"), "a", encoding="utf-8") as f:
         f.write(line + "\n")
-
-
-def _hub_frontmatter(meta, next_step, started, updated):
-    resume_cmd = f"claude --resume {meta.get('session_id') or '?'}"
-    head = ["---",
-            f"topic: {_yaml_val(meta['title'] or '(제목 없음)')}",
-            f"resume: {resume_cmd}",
-            f"next: {_yaml_val(next_step)}",
-            f"started: {started}",
-            f"updated: {updated}",
-            f"cwd: {meta['cwd'] or '?'}"]
-    branch = meta.get("git_branch")
-    if branch and branch != "HEAD":
-        head.append(f"git_branch: {branch}")
-    head += [f"tokens: in≈{meta['in_tok']}, out≈{meta['out_tok']}", "---"]
-    return "\n".join(head)
-
-
-def _drop_progress_block(progress, header):
-    """진행 로그에서 같은 헤더의 블록을 제거한다 (다음 '### ' 직전 또는 끝까지).
-    같은 날 두 번 flush 되면 같은 (날짜, sid8) 블록이 쌓이므로 옛 것을 걷어낸다."""
-    i = progress.find(header)
-    if i == -1:
-        return progress
-    j = progress.find("\n### ", i + 1)
-    return (progress[:i] + (progress[j + 1:] if j != -1 else "")).rstrip()
-
-
-def _update_hub(base, meta, hub_name, sid8, new_blocks, next_step, started):
-    """허브 노트: frontmatter·🔜 다음 갱신 + 📈 진행 로그에 새 블록 prepend(최신 위).
-    기존 노트가 구형(진행 로그 없음)이면 기존 본문은 아래에 보존."""
-    sessions_dir = os.path.join(base, "sessions")
-    os.makedirs(sessions_dir, exist_ok=True)
-    path = os.path.join(sessions_dir, hub_name + ".md")
-
-    existing_progress, old_body = "", ""
-    if os.path.exists(path):
-        txt = open(path, encoding="utf-8").read()
-        idx = txt.find(PROGRESS_HEADER)
-        if idx != -1:
-            existing_progress = txt[idx + len(PROGRESS_HEADER):].lstrip("\n")
-        else:
-            parts = txt.split("\n---\n", 1)  # frontmatter 이후 본문 보존
-            old_body = (parts[1] if len(parts) == 2 else txt).strip()
-
-    # 같은 (날짜, sid8) 블록이 이미 있으면 옛 것을 제거하고 새 것으로 갈음한다.
-    for b in new_blocks:
-        existing_progress = _drop_progress_block(existing_progress, b.split("\n", 1)[0])
-
-    today = datetime.now().strftime("%Y-%m-%d")
-    out = [_hub_frontmatter(meta, next_step, started, today), "",
-           NEXT_HEADER, "", f"- {next_step}", "", PROGRESS_HEADER, ""]
-    if new_blocks:
-        out.append("\n\n".join(new_blocks))
-    if existing_progress.strip():
-        out.append("\n" + existing_progress.rstrip())
-    if old_body:
-        out.append("\n---\n\n" + old_body)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(out).rstrip() + "\n")
 
 
 # ── 주제축 (topics/ · INDEX.md) ─────────────────────────────────────
@@ -1088,13 +1013,6 @@ def _append_topic(base, slug, date, sid8, progress, next_step,
             tail = txt[k:].lstrip("\n") if k != -1 else ""
             body = f"{NEXT_HEADER}\n\n- {next_step.strip()}\n"
             txt = txt[:j] + body + (f"\n{tail}" if tail else "")
-    # sessions: [...] 에 sid8 추가
-    ms = re.search(r"^sessions:\s*\[(.*?)\]\s*$", txt, re.M)
-    if ms:
-        cur = [s.strip() for s in ms.group(1).split(",") if s.strip()]
-        if sid8 not in cur:
-            cur.append(sid8)
-            txt = txt[:ms.start()] + f"sessions: [{', '.join(cur)}]" + txt[ms.end():]
     with open(path, "w", encoding="utf-8") as f:
         f.write(txt.rstrip() + "\n")
     return True
@@ -1126,67 +1044,62 @@ def _task_title(line):
     return s if len(s) <= TASK_TITLE_MAX else s[:TASK_TITLE_MAX].rstrip() + "…"
 
 
-def _open_tasks_by_topic(base):
-    """미완료 태스크를 주제별로 나눈다 → ({slug: [제목]}, [무소속 제목])."""
+def _open_tasks_by_topic(base, open_lines=None):
+    """미완료 태스크를 주제별로 나눈다 → ({slug: [원문 줄]}, [무소속 줄]).
+    open_lines 가 없으면 INDEX 자신에서 읽는다(사람이 체크만 한 경우)."""
+    if open_lines is None:
+        p = os.path.join(base, INDEX_FILENAME)
+        open_lines = _split_tasks(open(p, encoding="utf-8").read())[0] if os.path.exists(p) else []
     by_topic, orphan = {}, []
-    tf = os.path.join(base, TASKS_FILENAME)
-    if not os.path.exists(tf):
-        return by_topic, orphan
-    with open(tf, encoding="utf-8") as f:
-        for l in f.read().splitlines():
-            if not l.lstrip().lower().startswith("- [ ]"):
-                continue
-            t, title = _task_topic(l), _task_title(l)
-            if t:
-                by_topic.setdefault(t, []).append(title)
-            else:
-                orphan.append(title)
+    for l in open_lines:
+        t = _task_topic(l)
+        (by_topic.setdefault(t, []) if t else orphan).append(l)
     return by_topic, orphan
 
 
-def _write_index(base):
-    """topics/ 에서 INDEX.md 재생성 (0토큰). weekly 가 daily 에서 생성되는 것과 같은 방식.
-    작업현황 미완료를 주제 아래로 접어 넣어 '어느 프로젝트의 일인가'를 한눈에 보이게 한다."""
+def _write_index(base, open_lines=None, done_lines=None):
+    """INDEX.md 재생성. **태스크의 정본이자 목차**다.
+
+    사람은 체크박스만 건드리고 나머지는 자동 생성이다. open/done 을 주지 않으면
+    현재 파일에서 읽어 그대로 다시 렌더한다(FileChanged 로 체크만 바뀐 경우)."""
     d = os.path.join(base, TOPICS_DIRNAME)
     os.makedirs(d, exist_ok=True)
-    by_topic, orphan = _open_tasks_by_topic(base)
-    entries = _topic_order(base)   # 작업현황과 같은 순서·번호를 쓰기 위해 공용
+    path = os.path.join(base, INDEX_FILENAME)
+    if open_lines is None or done_lines is None:
+        cur = open(path, encoding="utf-8").read() if os.path.exists(path) else ""
+        o, dn = _split_tasks(cur)
+        open_lines = o if open_lines is None else open_lines
+        done_lines = dn if done_lines is None else done_lines
 
-    # 번호는 이 렌더 한정의 순번이다 — 영구 ID 가 아니다.
-    # 지시는 INDEX 를 열어보고 하므로 사용자가 보는 번호와 여기 번호가 같은 파일에서 나온다.
-    # 그래서 다음 렌더에 밀려도 무해하다. 대신 **기록물(plan·topics)에는 번호를 쓰지 않는다** —
-    # 거기 적힌 번호는 다음 렌더에 거짓이 된다.
+    by_topic, orphan = _open_tasks_by_topic(base, open_lines)
+    out = ["# 🧭 INDEX", "",
+           "> 주제·할 일 목차. **체크박스만 직접 건드리세요** — 나머지는 세션 종료 시 다시 씁니다.", "",
+           "## 🔧 진행 중인 주제", ""]
     active, paused = [], []
-    for n, (slug, m, st) in enumerate(entries, 1):
-        # 태스크가 있으면 그것이 곧 '다음'이다. 🔜 다음 을 함께 실으면 같은 말이 두 번
-        # 나오고, 체크로 첫 항목이 끝나도 🔜 다음 은 다음 flush 까지 낡은 채 남는다.
-        mine = by_topic.get(slug, ())
+    for n, (slug, m, st) in enumerate(_topic_order(base), 1):
+        mine = by_topic.pop(slug, [])
         line = f"- **{n}.** [[{TOPICS_DIRNAME}/{slug}|{m.get('title') or slug}]] `{st}`"
+        # 태스크가 있으면 그것이 곧 '다음'이다. 🔜 다음 을 함께 실으면 같은 말이 두 번 나온다.
         line += f" · 남은 일 {len(mine)}" if mine else f" — {m.get('next') or '_(다음 미기재)_'}"
         # 설계 문서 포인터는 **지시문**으로 둔다. "그쪽에 있다"로 끝나는 서술문은
         # 읽을지 여부를 읽는 쪽 판단에 맡기므로 전달이 보장되지 않는다.
         if m.get("plan"):
             line += f"\n  📄 먼저 `{m['plan']}` 를 읽어라. 전역 결정·기각 이력은 그쪽에 있다."
-        # 체크박스를 쓰지 않는다. INDEX 는 매 flush 마다 재생성되고 FileChanged 훅은
-        # 작업현황만 감시하므로, 여기서 체크하면 아무 일도 없이 다음 렌더에 사라진다.
-        for j, title in enumerate(by_topic.pop(slug, ()), 1):
-            line += f"\n\t- **{n}-{j}** {title}"
+        for j, l in enumerate(mine, 1):
+            line += "\n\t" + _numbered(l, f"{n}-{j}")
         (paused if st == "paused" else active).append(line)
     # 끝난(done) 주제나 사라진 슬러그에 달린 태스크는 흘려보내지 않고 기타로 모은다
     for left in by_topic.values():
         orphan += left
 
-    out = ["# 🧭 INDEX", "",
-           "> 주제 진입점. `topics/` 에서 자동 생성됩니다 — 직접 편집하지 마세요.",
-           "> 체크는 `📌 작업현황.md` 에서 합니다 (번호가 같습니다).", "",
-           "## 🔧 진행 중인 주제", ""]
     out += active or ["_(없음)_"]
     if orphan:
-        out += ["", "## ☑️ 기타 태스크", ""] + [f"- {t}" for t in orphan]
-    if paused:  # 지금 손대지 않는 것이므로 맨 아래
+        out += ["", "## ☑️ 기타 태스크", ""] + [_numbered(l, None) for l in orphan]
+    if paused:  # 지금 손대지 않는 것이므로 아래로
         out += ["", "## ⏸ 보류", ""] + paused
-    with open(os.path.join(base, INDEX_FILENAME), "w", encoding="utf-8") as f:
-        f.write("\n".join(out).rstrip() + "\n")
+    out += ["", TASKS_DONE_HEADER, ""]
+    out += list(done_lines) if done_lines else ["_(완료 항목 없음)_"]
+    _safe_write_index(path, "\n".join(out).rstrip() + "\n")
 
 
 def _write_weekly_digest(base, ref=None):
@@ -1217,7 +1130,7 @@ def _write_weekly_digest(base, ref=None):
             by_proj.setdefault(proj, []).append((ds[5:], text))
 
     done = []
-    for fn in (TASKS_FILENAME, ARCHIVE_FILENAME):
+    for fn in (INDEX_FILENAME, ARCHIVE_FILENAME):
         fp = os.path.join(base, fn)
         if os.path.exists(fp):
             for ln in open(fp, encoding="utf-8").read().splitlines():
@@ -1273,69 +1186,57 @@ def _process(transcript, base=None, db_path=DB_FILE, use_llm=True):
 
             start = _fmt_ts(meta["first_ts"])
             started = start.strftime("%Y-%m-%d") if start else datetime.now().strftime("%Y-%m-%d")
-            hhmm = start.strftime("%H%M") if start else "0000"
-            hub_name = f"{started}_{hhmm}_{_slug(meta['title'])}_{sid8}"
             project = _project_of(meta)
 
             current_tasks = ""
-            tf = os.path.join(base, TASKS_FILENAME)
+            tf = os.path.join(base, INDEX_FILENAME)
             if os.path.exists(tf):
                 current_tasks = open(tf, encoding="utf-8").read()
             open_cur, done_cur = _split_tasks(current_tasks)
 
             choices = _topic_choices(base)   # (slug, title) 닫힌 선택지
             groups = _group_by_date(new_turns, started)
-            new_blocks = []       # (progress log 블록)
-            last_summary = None
+            last_summary, last_conv = None, None
             for date, dturns in groups:
                 dmeta = {**meta, "turns": dturns}
                 summary = summarize(dmeta, "\n".join(open_cur), use_llm=use_llm, choices=choices)
                 last_summary = summary
-                _write_conversation_page(base, sid8, date, hub_name, dturns, meta.get("title"))
                 prog = summary["progress"].rstrip()
                 topic = summary.get("topic")
                 on_topic = bool(topic) and _append_topic(
                     base, topic, date, sid8, prog, summary["resume"],
                     summary.get("conclusions"), summary.get("dropped"))
-                # 주제에 붙였으면 hub 에는 포인터만 — 진행 로그 정본을 한 곳으로 유지한다.
-                # 양쪽에 같은 내용을 쓰면 한쪽을 사람이 고쳤을 때 조용히 분기한다.
-                head = f"### {date}  [[{CONV_DIRNAME}/{sid8}_{date}|💬 대화]]"
-                new_blocks.append(
-                    f"{head}\n→ 진행 로그: [[{TOPICS_DIRNAME}/{topic}]]" if on_topic
-                    else f"{head}\n{prog}")
-                _append_daily(base, date,
-                              topic if on_topic else project,
+                # 주제에 붙었으면 진행 로그 정본은 topics/ 다. 대화 페이지에는 머리말로만 얹는다.
+                _write_conversation_page(base, sid8, date, dturns, meta.get("title"),
+                                         None if on_topic else prog, topic if on_topic else None)
+                last_conv = f"{CONV_DIRNAME}/{sid8}_{date}"
+                _append_daily(base, date, topic if on_topic else project,
                               summary["progress"],
-                              f"{TOPICS_DIRNAME}/{topic}" if on_topic else hub_name)
+                              f"{TOPICS_DIRNAME}/{topic}" if on_topic else last_conv)
                 # 날짜별 결과를 이어받는다. 마지막 요약만 쓰면 중간 날짜에서 나온 태스크가
                 # 통째로 사라진다 — 다중 활동일 flush 는 실측 42%(19건 중 8건)다.
-                # 태그도 여기서 붙인다(날짜마다 topic 이 다를 수 있다).
-                # '#완료' 면 open_cur 를 그대로 둔다 — 기존 목록이 다시 쓰이므로 신규가 안 생긴다.
-                # (_update_tasks 는 계속 호출된다. 완료 전이·아카이브·완료일 스탬프는 그쪽 몫이다.)
+                # '#완료' 면 open_cur 를 그대로 둔다 — 기존 목록이 다시 쓰여 신규가 안 생긴다.
                 if not task_skip:
                     open_cur = _tag_topic(_split_tasks(summary["tasks_markdown"])[0],
                                           topic if on_topic else None)
                 _debug(f"[worker] {date}: topic={topic or 'none'} 진행 로그·대화·데일리 기록")
 
-            new_blocks.reverse()  # 최신이 위로
-            _update_hub(base, meta, hub_name, sid8, new_blocks, last_summary["resume"], started)
-            _update_tasks(base, "\n".join(open_cur), done_cur, hub_name, db_path,
+            _update_tasks(base, "\n".join(open_cur), done_cur, last_conv, db_path,
                           last_summary.get("topic"))
-            _write_index(base)    # topics/ + 작업현황 → INDEX.md 재생성 (0토큰)
             # 이번 flush가 건드린 모든 주차 + 이번 주를 재생성 (주 경계 넘김 대응)
             weeks = {}
             for date, _ in groups:
                 try:
-                    d = datetime.strptime(date, "%Y-%m-%d")
+                    dd = datetime.strptime(date, "%Y-%m-%d")
                 except ValueError:
                     continue
-                weeks[(d.isocalendar()[0], d.isocalendar()[1])] = d
+                weeks[(dd.isocalendar()[0], dd.isocalendar()[1])] = dd
             now = datetime.now()
             weeks[(now.isocalendar()[0], now.isocalendar()[1])] = now
-            for d in weeks.values():
-                _write_weekly_digest(base, d)
+            for dd in weeks.values():
+                _write_weekly_digest(base, dd)
             db_set_processed(sid, len(all_turns), db_path)
-            _debug(f"[worker] DONE: +{len(new_turns)}turn, {len(groups)}일, hub={hub_name}")
+            _debug(f"[worker] DONE: +{len(new_turns)}turn, {len(groups)}일")
     except Exception as e:
         import traceback
         _debug("[worker] ERROR: " + repr(e) + "\n" + traceback.format_exc())
