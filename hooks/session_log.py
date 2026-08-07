@@ -508,15 +508,14 @@ def build_summary_prompt(meta, current_tasks, choices=()):
   · 목록에 없는 새 슬러그를 만들지 마라. 반드시 목록의 값 또는 "none" 이어야 한다.
 - progress: 이번에 '실제로 한 일'을 1~3개의 짧은 불릿(- ...)으로. 계획이 아니라 한 일.
 - resume: '지금 앉으면 무엇부터' **한 줄**. 남은 단계를 전부 늘어놓지 마라 — 그건 태스크가 담는다.
-- tasks_markdown: 현재 미완료 작업 목록을 유지하되 - [ ] 체크박스 목록 전체를 반환.
-  · **남은 일은 전부 태스크로 만든다.** 주제의 다음 단계도 포함한다 — 순서대로 체크해 나가면 되고,
-    체크박스여야 완료 이력이 남는다. 순서는 목록 순서로 표현하고 필요하면 제목 앞에 ① ② ③ 를 붙여라.
+- tasks_add: **이번 대화에서 새로 생긴 할 일만** 배열로. 기존 목록은 절대 반환하지 마라(건드릴 수 없다).
+  · 원소는 {"text": "할 일", "after": "이 항목 바로 뒤에 넣어라"} 형태. 순서가 상관없으면 after 를 빼라.
+  · after 에는 '# 현재 미완료 작업' 목록에 있는 문구를 그대로 적어라. 못 찾으면 맨 뒤에 붙는다.
   · **한 줄은 80자 안쪽.** 명령·경로·근거 같은 상세는 쓰지 마라 — 그건 주제의 진행 로그와 설계 문서가
     담는다. 태스크는 '무엇을 해야 하는가' 한 줄이다.
-  · **기존 순서를 바꾸지 마라.** 새 항목은 관련된 것 바로 뒤에 넣는다.
-  · `**3-2**` 같은 번호는 저장할 때 자동으로 붙으니 직접 쓰지 마라.
-  · 기존 항목 보존, 관련 작업은 하나로 묶기(과도 분할 금지).
-  · 완료 판정·삭제·체크(- [x]) 변경 금지(완료는 사용자가 직접). 기존 `[[...]]` 링크 보존, 새 링크 만들지 마라.
+  · 주제의 다음 단계도 포함한다 — 순서대로 체크해 나가면 되고, 체크박스여야 완료 이력이 남는다.
+    순서가 있으면 제목 앞에 ① ② ③ 를 붙여라.
+  · 이미 목록에 있는 것과 같은 일이면 넣지 마라. 새로 생긴 게 없으면 [] 로 두어라.
 - conclusions: **다음에 같은 작업을 할 때 몰랐으면 헤맬 사실**만 배열로. 수치·조건·이유를 담아라.
   · 이번에 무엇을 했는지는 progress 의 몫이다. 여기 쓰지 마라.
   · 해당 없으면 [] 로 두어라. 억지로 만들지 마라.
@@ -528,10 +527,10 @@ def build_summary_prompt(meta, current_tasks, choices=()):
         f"{instructions}\n\n"
         "반드시 아래 JSON 하나로만 답하라. 코드펜스/설명 금지. 값은 모두 문자열:\n"
         '{"topic": "slug 또는 none", "progress": "- ...", "resume": "...",\n'
-        '  "conclusions": [], "dropped": [], "tasks_markdown": "..."}\n\n'
+        '  "conclusions": [], "dropped": [], "tasks_add": []}\n\n'
         f"# 주제 목록\n{slug_list}\n\n"
         f"# 프로젝트\n{title}\n\n"
-        f"# 현재 미완료 작업\n{current_tasks or '(없음)'}\n\n"
+        f"# 현재 미완료 작업 (참고용 — 중복 방지·after 지정에만 쓴다)\n{current_tasks or '(없음)'}\n\n"
         f"# 이번에 새로 진행한 대화\n{conversation}\n"
     )
     # 구성요소별 크기 — "무관한 태스크 목록이 비용을 얼마나 밀어올리는가" 를 나중에 따지기 위함
@@ -554,11 +553,11 @@ def _extract_json(text):
 def _valid_summary(parsed):
     if not isinstance(parsed, dict):
         return None
-    for k in ("topic", "progress", "resume", "tasks_markdown"):
+    for k in ("topic", "progress", "resume"):
         v = parsed.get(k)
         if v is not None and not isinstance(v, str):
             return None
-    for k in ("conclusions", "dropped"):
+    for k in ("conclusions", "dropped", "tasks_add"):
         v = parsed.get(k)
         if v is not None and not isinstance(v, list):
             return None
@@ -568,8 +567,24 @@ def _valid_summary(parsed):
         "dropped": [str(x) for x in (parsed.get("dropped") or []) if str(x).strip()],
         "progress": parsed.get("progress"),
         "resume": parsed.get("resume"),
-        "tasks_markdown": parsed.get("tasks_markdown"),
+        "tasks_add": _norm_adds(parsed.get("tasks_add")),
     }
+
+
+def _norm_adds(raw):
+    """tasks_add 원소를 {'text','after'} 로 정규화. 문자열만 온 경우도 받아준다."""
+    out = []
+    for it in (raw or []):
+        if isinstance(it, str):
+            t, af = it, None
+        elif isinstance(it, dict):
+            t, af = it.get("text") or it.get("task") or "", it.get("after")
+        else:
+            continue
+        t = re.sub(r"^\s*-\s*\[[ xX]\]\s*", "", str(t)).strip()
+        if t:
+            out.append({"text": t, "after": (str(af).strip() if af else None)})
+    return out
 
 
 def call_claude(prompt):
@@ -612,7 +627,7 @@ def summarize(meta, current_tasks, use_llm=True, choices=()):
     if not use_llm:
         return {"topic": None, "conclusions": [], "dropped": [],
                 "progress": f"- [{title}] (dry-run)", "resume": "(dry-run)",
-                "tasks_markdown": current_tasks or "", "_usage": None, "_parts": {}}
+                "tasks_add": [], "_usage": None, "_parts": {}}
     base_prompt, parts = build_summary_prompt(meta, current_tasks, choices)
     nudge = "\n\n[중요] 직전 응답이 형식에 안 맞았다. JSON 객체 하나만 출력하라."
     valid, usage = None, None
@@ -639,7 +654,7 @@ def summarize(meta, current_tasks, use_llm=True, choices=()):
         "dropped": valid["dropped"],
         "progress": valid["progress"] or "- (내용 없음)",
         "resume": valid["resume"] or "(다음 미기재)",
-        "tasks_markdown": valid["tasks_markdown"] or (current_tasks or ""),
+        "tasks_add": valid["tasks_add"],
         "_usage": usage,
         "_parts": parts,
     }
@@ -718,36 +733,47 @@ def _archive_done(base, lines):
             f.write(l.rstrip() + "\n")
 
 
-def _link_tasks(lines, conv_link, topic=None, prev_keys=None):
-    """새로 생긴 태스크에만 주제 태그와 대화 링크를 붙인다.
+def _find_task(lines, needle):
+    """`after` 로 지정된 문구와 같은 줄의 위치. 정규화 일치 → 부분 포함 → 유사도 순으로 찾는다."""
+    if not needle:
+        return None
+    n = _norm_line(needle)
+    keys = [_norm_line(re.sub(r"\[\[.*?\]\]", "", l)) for l in lines]
+    for i, k in enumerate(keys):
+        if k == n:
+            return i
+    for i, k in enumerate(keys):
+        if n and (n in k or k in n):
+            return i
+    best, bi = 0.0, None
+    for i, k in enumerate(keys):
+        r = difflib.SequenceMatcher(None, n, k).ratio()
+        if r > best:
+            best, bi = r, i
+    return bi if best >= 0.6 else None
 
-    '링크가 없으면 새 것'으로 판정하면 안 된다 — 사람이 손으로 넣은 태스크에는 링크가 없어서
-    다음 flush 가 무관한 세션의 대화를 일괄로 붙여버린다(실제 발생: 23건이 한 대화로 몰림).
-    **직전 목록에 없던 키**만 새 것이다."""
-    def is_new(line):
-        if prev_keys is None:
-            return "[[" not in line          # 폴백(직전 목록을 못 구한 경우)
-        return _task_key(line) not in prev_keys
 
-    out = []
-    for s in lines:
-        s = s.rstrip()
-        fresh = is_new(s)
-        if topic and fresh and f"[[{TOPICS_DIRNAME}/" not in s:
-            s = f"{s}  [[{TOPICS_DIRNAME}/{topic}|🔧]]"
-        if conv_link and fresh and "↗ 대화]]" not in s and "↗ 세션]]" not in s:
-            s = f"{s}  [[{conv_link}|↗ 대화]]"
-        out.append(s)
+def _apply_task_adds(open_cur, adds, topic, conv_link):
+    """새 태스크를 목록에 넣는다. after 가 가리키는 줄 **뒤에**, 못 찾으면 맨 뒤에.
+
+    기존 줄은 손대지 않는다 — LLM 은 추가분만 주므로 순서·태그·링크가 훼손될 수 없다."""
+    out = list(open_cur)
+    for a in adds or []:
+        text = a["text"]
+        if _dedup_against([text], [re.sub(r"\[\[.*?\]\]", "", l) for l in out]) == []:
+            _debug(f"[worker] 태스크 중복 — 건너뜀: {text[:40]}")
+            continue
+        line = f"- [ ] {text}"
+        if topic:
+            line += f"  [[{TOPICS_DIRNAME}/{topic}|🔧]]"
+        if conv_link:
+            line += f"  [[{conv_link}|↗ 대화]]"
+        pos = _find_task(out, a.get("after"))
+        if pos is None:
+            out.append(line)
+        else:
+            out.insert(pos + 1, line)
     return out
-
-
-def _tag_topic(lines, topic):
-    """이번 콜에서 새로 생긴 줄(링크 없음)에 그 날짜의 주제 태그를 붙인다.
-    날짜 그룹마다 topic 이 다를 수 있으므로 루프 안에서 그때그때 붙여야 한다 —
-    마지막 날짜의 topic 을 전부에 붙이면 다른 날 생긴 태스크가 엉뚱한 주제로 간다."""
-    if not topic:
-        return lines
-    return [l if "[[" in l else f"{l}  [[{TOPICS_DIRNAME}/{topic}|🔧]]" for l in lines]
 
 
 def _task_topic(line):
@@ -756,23 +782,53 @@ def _task_topic(line):
     return m.group(1).strip() if m else None
 
 
-def _restore_task_topics(open_lines, base):
-    """LLM 이 목록을 재작성하며 주제 태그를 떨어뜨려도 기존 파일에서 되살린다.
-    태그가 날아가면 그룹핑이 통째로 무너지므로 링크 보존 지시에만 기대지 않는다."""
-    tf = os.path.join(base, INDEX_FILENAME)
-    if not os.path.exists(tf):
-        return open_lines
-    prev = {}
-    with open(tf, encoding="utf-8") as f:
-        for l in f.read().splitlines():
-            t = _task_topic(l)
-            if t:
-                prev[_task_key(l)] = t
-    out = []
-    for l in open_lines:
-        t = prev.get(_task_key(l)) if not _task_topic(l) else None
-        out.append(f"{l}  [[{TOPICS_DIRNAME}/{t}|🔧]]" if t else l)
+def _find_task(lines, needle):
+    """`after` 로 지정된 문구와 같은 줄의 위치. 정규화 일치 → 부분 포함 → 유사도 순으로 찾는다."""
+    if not needle:
+        return None
+    n = _norm_line(needle)
+    keys = [_norm_line(re.sub(r"\[\[.*?\]\]", "", l)) for l in lines]
+    for i, k in enumerate(keys):
+        if k == n:
+            return i
+    for i, k in enumerate(keys):
+        if n and (n in k or k in n):
+            return i
+    best, bi = 0.0, None
+    for i, k in enumerate(keys):
+        r = difflib.SequenceMatcher(None, n, k).ratio()
+        if r > best:
+            best, bi = r, i
+    return bi if best >= 0.6 else None
+
+
+def _apply_task_adds(open_cur, adds, topic, conv_link):
+    """새 태스크를 목록에 넣는다. after 가 가리키는 줄 **뒤에**, 못 찾으면 맨 뒤에.
+
+    기존 줄은 손대지 않는다 — LLM 은 추가분만 주므로 순서·태그·링크가 훼손될 수 없다."""
+    out = list(open_cur)
+    for a in adds or []:
+        text = a["text"]
+        if _dedup_against([text], [re.sub(r"\[\[.*?\]\]", "", l) for l in out]) == []:
+            _debug(f"[worker] 태스크 중복 — 건너뜀: {text[:40]}")
+            continue
+        line = f"- [ ] {text}"
+        if topic:
+            line += f"  [[{TOPICS_DIRNAME}/{topic}|🔧]]"
+        if conv_link:
+            line += f"  [[{conv_link}|↗ 대화]]"
+        pos = _find_task(out, a.get("after"))
+        if pos is None:
+            out.append(line)
+        else:
+            out.insert(pos + 1, line)
     return out
+
+
+def _task_topic(line):
+    """태스크 줄에 심긴 주제 슬러그."""
+    m = re.search(r"\[\[" + re.escape(TOPICS_DIRNAME) + r"/([^|\]]+)", line)
+    return m.group(1).strip() if m else None
 
 
 def _count_tasks(md):
@@ -814,7 +870,7 @@ def _safe_write_index(path, new_md):
     return True
 
 
-def _update_tasks(base, tasks_markdown, done_cur, conv_link, db_path=DB_FILE, topic=None):
+def _update_tasks(base, open_new, done_cur, conv_link, db_path=DB_FILE, topic=None):
     """미완료/완료를 정리해 INDEX 를 다시 쓴다.
 
     태스크의 정본은 INDEX.md 하나다 — 별도 목록 파일을 두면 번호가 어긋나고
@@ -828,13 +884,9 @@ def _update_tasks(base, tasks_markdown, done_cur, conv_link, db_path=DB_FILE, to
     if os.path.exists(tf_now):
         with open(tf_now, encoding="utf-8") as f:
             prev_open, done_cur = _split_tasks(f.read())
-    prev_keys = {_task_key(l) for l in prev_open} | {_task_key(l) for l in done_cur}
     today = datetime.now().strftime("%Y-%m-%d")
-    open_new, _ = _split_tasks(tasks_markdown or "")
     done_keys = {_task_key(d) for d in done_cur}
-    open_new = [o for o in open_new if _task_key(o) not in done_keys]
-    open_new = _restore_task_topics(open_new, base)
-    open_new = _link_tasks(open_new, conv_link, topic, prev_keys)
+    open_new = [o for o in (open_new or []) if _task_key(o) not in done_keys]
     # 번호는 렌더 순번이라 완료 시점에 뗀다 (아카이브까지 그대로 간다)
     done_stamped = [_stamp_done(_numbered(d, None), _completion_date(_task_key(d), today, db_path))
                     for d in done_cur]
@@ -983,6 +1035,9 @@ def _section_items(txt, header):
     return out
 
 
+SUBSTR_MIN = 6      # 부분 포함으로 중복 판정하려면 이 길이 이상이어야 한다
+
+
 def _norm_line(s):
     return re.sub(r"[\s`*_·,.\-—()\[\]]+", "", s).lower()
 
@@ -996,7 +1051,10 @@ def _dedup_against(items, existing, threshold=0.75):
         n = norm(it)
         if not n:
             continue
-        if any(n in e or e in n or difflib.SequenceMatcher(None, n, e).ratio() >= threshold
+        # 부분 포함 검사에는 최소 길이를 둔다 — 짧은 항목이 긴 항목의 우연한 부분 문자열로
+        # 걸려 사라진다("배포" 가 "VM 재배포…" 에 포함되는 식).
+        if any((len(n) >= SUBSTR_MIN and (n in e or e in n))
+               or difflib.SequenceMatcher(None, n, e).ratio() >= threshold
                for e in seen):
             continue
         out.append(it.strip())
@@ -1362,8 +1420,8 @@ def _process(transcript, base=None, db_path=DB_FILE, use_llm=True):
                 # 통째로 사라진다 — 다중 활동일 flush 는 실측 42%(19건 중 8건)다.
                 # '#완료' 면 open_cur 를 그대로 둔다 — 기존 목록이 다시 쓰여 신규가 안 생긴다.
                 if not task_skip:
-                    open_cur = _tag_topic(_split_tasks(summary["tasks_markdown"])[0],
-                                          topic if on_topic else None)
+                    open_cur = _apply_task_adds(open_cur, summary.get("tasks_add"),
+                                                topic if on_topic else None, last_conv)
                 processed_upto += len(dturns)
                 done_groups += 1
                 _debug(f"[worker] {date}: topic={topic or 'none'} 진행 로그·대화·데일리 기록")
@@ -1372,7 +1430,7 @@ def _process(transcript, base=None, db_path=DB_FILE, use_llm=True):
                 _debug("[worker] ABORT: 한 그룹도 처리 못 함 — 마커 유지")
                 return
 
-            _update_tasks(base, "\n".join(open_cur), done_cur, last_conv, db_path,
+            _update_tasks(base, open_cur, done_cur, last_conv, db_path,
                           last_summary.get("topic"))
             # 이번 flush가 건드린 모든 주차 + 이번 주를 재생성 (주 경계 넘김 대응)
             weeks = {}
@@ -1411,6 +1469,23 @@ def _run_dry(use_llm):
 CATCHUP_DAYS = int(os.environ.get("SESSIONLOG_CATCHUP_DAYS", "3"))
 
 
+LAUNCHD_LOG_MAX = 1_000_000     # launchd StandardOut/ErrorPath 는 로테이션이 없다
+
+
+def _trim_launchd_logs():
+    """launchd 가 append 하는 로그에 상한을 둔다. 정상 동작 시에는 비어 있지만
+    (진행 내역은 _debug 로 별도 파일에 가고 그쪽은 7일 로테이션이 있다),
+    예외가 반복되면 무한히 자랄 수 있어 실행 끝에 잘라 둔다."""
+    for f in glob.glob("/tmp/claude-obsidian-logger.catchup.*"):
+        try:
+            if os.path.getsize(f) > LAUNCHD_LOG_MAX:
+                with open(f, "w"):
+                    pass
+                _debug(f"[catchup] {os.path.basename(f)} 이 상한 초과 — 비움")
+        except OSError:
+            pass
+
+
 def _catchup():
     """열려 있는(=최근 수정된) 세션들을 SessionEnd 와 똑같이 기록한다. 세션 자체는 건드리지 않는다.
 
@@ -1423,6 +1498,7 @@ def _catchup():
     _debug(f"[catchup] 대상 {len(files)}개 (최근 {CATCHUP_DAYS}일)")
     for f in sorted(files, key=os.path.getmtime):
         _process(f)
+    _trim_launchd_logs()
     _debug("[catchup] 완료")
 
 
