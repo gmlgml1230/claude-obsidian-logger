@@ -37,7 +37,7 @@ from datetime import datetime, timedelta
 VAULT = os.environ.get("OBSIDIAN_VAULT") or os.path.expanduser("~/Documents/Obsidian")
 SUMMARY_MODEL = os.environ.get("SESSIONLOG_MODEL", "claude-sonnet-4-6")
 TASKS_FILENAME = os.environ.get("SESSIONLOG_TASKS_FILE", "📌 작업현황.md")
-TASKS_OPEN_HEADER = "## 🔧 진행 중"
+TASKS_OPEN_HEADER = "## ☑️ 미완료 태스크"
 TASKS_DONE_HEADER = "## ✅ 완료"
 DONE_RETAIN_DAYS = 14
 ARCHIVE_FILENAME = "완료 아카이브.md"
@@ -479,15 +479,15 @@ def build_summary_prompt(meta, current_tasks, choices=()):
 - topic: 이 대화가 속한 주제 슬러그를 '# 주제 목록'에서 **정확히 하나** 골라라. 해당 없으면 "none".
   · 목록에 없는 새 슬러그를 만들지 마라. 반드시 목록의 값 또는 "none" 이어야 한다.
 - progress: 이번에 '실제로 한 일'을 1~3개의 짧은 불릿(- ...)으로. 계획이 아니라 한 일.
-- resume: 재개 지점 + 남은 단계 요약. '지금 앉으면 무엇부터'로 시작하고, 남은 단계가 더 있으면
-  '① … → ② …' 로 이어 붙여라. 이 주제의 로드맵이며 매번 덮어쓴다.
+- resume: '지금 앉으면 무엇부터' **한 줄**. 남은 단계를 전부 늘어놓지 마라 — 그건 태스크가 담는다.
 - tasks_markdown: 현재 미완료 작업 목록을 유지하되 - [ ] 체크박스 목록 전체를 반환.
-  · **주제의 다음 단계는 resume 에만 쓴다.** 순서가 있고 서로 의존하는 단계를 태스크로 쪼개지 마라.
-  · 태스크로 만들 것은 셋뿐이다 — ① 주제 밖 단발 작업, ② 주제 안이지만 순서 밖이라 잊기 쉬운 일,
-    ③ 완료 날짜를 남겨야 하는 일. 셋 중 어느 것도 아니면 만들지 마라.
-  · **topic 이 "none" 이면 남은 일을 반드시 태스크로 남겨라(= ①).** 주제가 없으면 resume 은
-    세션 노트에만 적히고 목차에는 실리지 않아, 태스크로 남기지 않으면 어디에서도 보이지 않는다.
-  · 기존 항목 보존, 관련 작업은 하나로 묶기(과도 분할 금지), 새 작업은 관련끼리 묶어 추가.
+  · **남은 일은 전부 태스크로 만든다.** 주제의 다음 단계도 포함한다 — 순서대로 체크해 나가면 되고,
+    체크박스여야 완료 이력이 남는다. 순서는 목록 순서로 표현하고 필요하면 제목 앞에 ① ② ③ 를 붙여라.
+  · **한 줄은 80자 안쪽.** 명령·경로·근거 같은 상세는 쓰지 마라 — 그건 주제의 진행 로그와 설계 문서가
+    담는다. 태스크는 '무엇을 해야 하는가' 한 줄이다.
+  · **기존 순서를 바꾸지 마라.** 새 항목은 관련된 것 바로 뒤에 넣는다.
+  · `**3-2**` 같은 번호는 저장할 때 자동으로 붙으니 직접 쓰지 마라.
+  · 기존 항목 보존, 관련 작업은 하나로 묶기(과도 분할 금지).
   · 완료 판정·삭제·체크(- [x]) 변경 금지(완료는 사용자가 직접). 기존 `[[...]]` 링크 보존, 새 링크 만들지 마라.
 - conclusions: **다음에 같은 작업을 할 때 몰랐으면 헤맬 사실**만 배열로. 수치·조건·이유를 담아라.
   · 이번에 무엇을 했는지는 progress 의 몫이다. 여기 쓰지 마라.
@@ -609,16 +609,48 @@ def _stamp_done(line, date_str):
     return line if "✅" in line else f"{line} ✅ {date_str}"
 
 
-def _compose_tasks(open_lines, done_lines):
+def _compose_tasks(open_lines, done_lines, base=None):
+    """미완료는 **INDEX 와 같은 그룹·같은 번호**로 묶어 쓴다.
+    두 파일의 형태가 다르면 INDEX 에서 본 5-2 를 여기서 찾을 수 없다.
+    완료는 시간순이 자연스러우므로 묶지 않는다."""
     parts = [TASKS_OPEN_HEADER, ""]
-    parts += open_lines if open_lines else ["_(진행 중 작업 없음)_"]
+    if not open_lines:
+        parts += ["_(미완료 태스크 없음)_"]
+    elif base is None:
+        parts += open_lines                      # 그룹 정보를 못 구하면 평면
+    else:
+        rest = list(open_lines)
+        for n, (slug, m, _st) in enumerate(_topic_order(base), 1):
+            mine = [l for l in rest if _task_topic(l) == slug]
+            if not mine:
+                continue
+            rest = [l for l in rest if l not in mine]
+            parts += [f"### {n}. {m.get('title') or slug}", ""]
+            for j, l in enumerate(mine, 1):
+                parts.append(_numbered(l, f"{n}-{j}"))
+            parts.append("")
+        if rest:
+            parts += ["### 기타", ""] + rest + [""]
     parts += ["", TASKS_DONE_HEADER, ""]
     parts += list(reversed(done_lines)) if done_lines else ["_(완료 항목 없음)_"]
     return "\n".join(parts).rstrip() + "\n"
 
 
+NUM_RE = re.compile(r"^(-\s*\[[ xX]\]\s*)(?:\*\*[0-9]+-[0-9]+\*\*\s*)?(.*)$")
+
+
+def _numbered(line, num):
+    """줄에 **n-j** 번호를 붙인다(이미 있으면 갈아끼운다). 번호는 렌더 순번이라 매번 다시 매긴다."""
+    m = NUM_RE.match(line)
+    return f"{m.group(1)}**{num}** {m.group(2)}" if m else line
+
+
 def _task_key(line):
+    """항목의 동일성 판정 키. **렌더 순번(3-2)과 링크는 반드시 빼야 한다** —
+    주제가 하나 추가돼 번호가 밀리면 같은 태스크가 새 항목으로 인식되어
+    완료 시각·주제 태그·아카이브 중복 판정이 전부 끊긴다."""
     s = re.sub(r"-\s*\[[ xX]\]", "", line)
+    s = re.sub(r"\*\*\d+-\d+\*\*", "", s)
     s = re.sub(r"\[\[.*?\]\]", "", s)
     s = re.sub(r"✅\s*\d{4}-\d{2}-\d{2}", "", s)
     return s.strip().lower()
@@ -764,7 +796,7 @@ def _update_tasks(base, tasks_markdown, done_cur, hub_name, db_path=DB_FILE, top
     if old:
         _archive_done(base, old)
         _debug(f"[worker] 완료 아카이브 이동: {len(old)}건")
-    composed = _link_tasks(_compose_tasks(open_new, recent), hub_name, topic)
+    composed = _link_tasks(_compose_tasks(open_new, recent, base), hub_name, topic)
     _safe_write_tasks(os.path.join(base, TASKS_FILENAME), composed)
     _sync_task_states(base, db_path)  # 쓰기 후 snapshot 갱신
 
@@ -1068,10 +1100,25 @@ def _append_topic(base, slug, date, sid8, progress, next_step,
     return True
 
 
+def _topic_order(base):
+    """진행 중 주제를 표시 순서대로. INDEX 와 작업현황이 **같은 번호**를 쓰게 하려면
+    순서를 한 곳에서 정해야 한다. 두 파일이 다른 순서를 내면 5-2 를 보고 찾아갈 수 없다."""
+    d = os.path.join(base, TOPICS_DIRNAME)
+    entries = []
+    for slug in _topic_slugs(base):
+        m = _topic_meta(os.path.join(d, f"{slug}.md"))
+        st = m.get("status") or "active"
+        if st != "done":
+            entries.append((slug, m, st))
+    entries.sort(key=lambda e: e[2] == "paused")   # 보류는 뒤로 (stable)
+    return entries
+
+
 def _task_title(line):
     """INDEX 표시용 짧은 제목. 상세는 작업현황.md 가 정본이므로 여기선 잘라도 된다
     (한 줄이 300자를 넘는 태스크가 있어, 그대로 실으면 목차가 목차 구실을 못 한다)."""
     s = re.sub(r"^\s*-\s*\[[ xX]\]\s*", "", line)
+    s = re.sub(r"^\*\*\d+-\d+\*\*\s*", "", s)   # 저장된 번호는 걷어낸다(렌더에서 다시 붙인다)
     s = re.sub(r"\[\[.*?\]\]", "", s).strip()
     head = s.split(": ", 1)[0].strip()
     if len(head) >= 5:            # 'A: B' 형태면 A 가 제목이다. 너무 짧으면 오탐
@@ -1103,14 +1150,7 @@ def _write_index(base):
     d = os.path.join(base, TOPICS_DIRNAME)
     os.makedirs(d, exist_ok=True)
     by_topic, orphan = _open_tasks_by_topic(base)
-    entries = []
-    for slug in _topic_slugs(base):
-        m = _topic_meta(os.path.join(d, f"{slug}.md"))
-        st = m.get("status") or "active"
-        if st != "done":
-            entries.append((slug, m, st))
-    # 보류는 맨 아래에 실리므로 번호도 그 순서를 따른다 (sort 는 stable)
-    entries.sort(key=lambda e: e[2] == "paused")
+    entries = _topic_order(base)   # 작업현황과 같은 순서·번호를 쓰기 위해 공용
 
     # 번호는 이 렌더 한정의 순번이다 — 영구 ID 가 아니다.
     # 지시는 INDEX 를 열어보고 하므로 사용자가 보는 번호와 여기 번호가 같은 파일에서 나온다.
@@ -1118,25 +1158,31 @@ def _write_index(base):
     # 거기 적힌 번호는 다음 렌더에 거짓이 된다.
     active, paused = [], []
     for n, (slug, m, st) in enumerate(entries, 1):
-        line = (f"- **{n}.** [[{TOPICS_DIRNAME}/{slug}|{m.get('title') or slug}]] "
-                f"`{st}` — {m.get('next') or '_(다음 미기재)_'}")
+        # 태스크가 있으면 그것이 곧 '다음'이다. 🔜 다음 을 함께 실으면 같은 말이 두 번
+        # 나오고, 체크로 첫 항목이 끝나도 🔜 다음 은 다음 flush 까지 낡은 채 남는다.
+        mine = by_topic.get(slug, ())
+        line = f"- **{n}.** [[{TOPICS_DIRNAME}/{slug}|{m.get('title') or slug}]] `{st}`"
+        line += f" · 남은 일 {len(mine)}" if mine else f" — {m.get('next') or '_(다음 미기재)_'}"
         # 설계 문서 포인터는 **지시문**으로 둔다. "그쪽에 있다"로 끝나는 서술문은
         # 읽을지 여부를 읽는 쪽 판단에 맡기므로 전달이 보장되지 않는다.
         if m.get("plan"):
             line += f"\n  📄 먼저 `{m['plan']}` 를 읽어라. 전역 결정·기각 이력은 그쪽에 있다."
+        # 체크박스를 쓰지 않는다. INDEX 는 매 flush 마다 재생성되고 FileChanged 훅은
+        # 작업현황만 감시하므로, 여기서 체크하면 아무 일도 없이 다음 렌더에 사라진다.
         for j, title in enumerate(by_topic.pop(slug, ()), 1):
-            line += f"\n\t- [ ] **{n}-{j}** {title}"
+            line += f"\n\t- **{n}-{j}** {title}"
         (paused if st == "paused" else active).append(line)
     # 끝난(done) 주제나 사라진 슬러그에 달린 태스크는 흘려보내지 않고 기타로 모은다
     for left in by_topic.values():
         orphan += left
 
     out = ["# 🧭 INDEX", "",
-           "> 주제 진입점. `topics/` 에서 자동 생성됩니다 — 직접 편집하지 마세요.", "",
-           "## 🔧 진행 중", ""]
+           "> 주제 진입점. `topics/` 에서 자동 생성됩니다 — 직접 편집하지 마세요.",
+           "> 체크는 `📌 작업현황.md` 에서 합니다 (번호가 같습니다).", "",
+           "## 🔧 진행 중인 주제", ""]
     out += active or ["_(없음)_"]
     if orphan:
-        out += ["", "## ☑️ 기타 태스크", ""] + [f"- [ ] {t}" for t in orphan]
+        out += ["", "## ☑️ 기타 태스크", ""] + [f"- {t}" for t in orphan]
     if paused:  # 지금 손대지 않는 것이므로 맨 아래
         out += ["", "## ⏸ 보류", ""] + paused
     with open(os.path.join(base, INDEX_FILENAME), "w", encoding="utf-8") as f:
