@@ -42,6 +42,9 @@ ARCHIVE_FILENAME = "완료 아카이브.md"
 TASKS_DONE_HEADER = f"## ✅ 완료 ({DONE_RETAIN_DAYS // 7}주 보관)"
 GUARD_ENV = "CLAUDE_SESSIONLOG_RUNNING"
 
+# 요약 프롬프트의 첫 문장. 요약기 자신의 `claude -p` 세션을 판별하는 데도 쓴다(_is_summarizer_session).
+SUMMARY_SIGNATURE = "너는 내 작업 기록 비서다"
+
 MAX_TOOL_RESULT_CHARS = 280
 CLAUDE_TIMEOUT_SEC = 300
 
@@ -502,10 +505,16 @@ def build_summary_prompt(meta, current_tasks, choices=()):
     conversation = render_conversation_for_summary(meta)
     title = meta.get("title") or "(제목 없음)"
     slug_list = "\n".join(f"- {sl} — {ti}" for sl, ti in choices) or "- (등록된 주제 없음)"
-    instructions = """너는 내 작업 기록 비서다. 아래는 한 프로젝트 세션에서 '이번에 새로 진행한 대화'다. 읽고 뽑아라.
+    # 시그니처를 상수로 이어 붙인다 — f-string 을 쓰면 본문의 {"slug": …} 중괄호가 깨진다.
+    instructions = SUMMARY_SIGNATURE + """. 아래는 한 프로젝트 세션에서 '이번에 새로 진행한 대화'다. 읽고 뽑아라.
 
 - topic: 이 대화가 속한 주제 슬러그를 '# 주제 목록'에서 **정확히 하나** 골라라. 해당 없으면 "none".
-  · 목록에 없는 새 슬러그를 만들지 마라. 반드시 목록의 값 또는 "none" 이어야 한다.
+  · 목록에 없는 값을 topic 에 넣지 마라. 반드시 목록의 값 또는 "none" 이어야 한다.
+- topic_new: topic 이 "none" 일 때만 채운다. 이 대화를 한 덩어리로 부를 이름을 지어라.
+  · {"slug": "kebab-case-영문", "title": "한글 제목"} 형태. slug 는 소문자 영문·숫자·하이픈만,
+    title 은 40자 안쪽.
+  · 주제 파일을 만들지는 않는다 — 이 대화에서 나온 할 일들을 목차에서 **한 묶음으로 묶는 이름표**다.
+  · 이번 대화에 남은 할 일도 결론도 없으면 null 로 두어라.
 - progress: 이번에 '실제로 한 일'을 1~3개의 짧은 불릿(- ...)으로. 계획이 아니라 한 일.
 - resume: '지금 앉으면 무엇부터' **한 줄**. 남은 단계를 전부 늘어놓지 마라 — 그건 태스크가 담는다.
 - tasks_add: **이번 대화에서 새로 생긴 할 일만** 배열로. 기존 목록은 절대 반환하지 마라(건드릴 수 없다).
@@ -525,8 +534,8 @@ def build_summary_prompt(meta, current_tasks, choices=()):
 모든 답변 한국어. 확실치 않으면 짧게."""
     prompt = (
         f"{instructions}\n\n"
-        "반드시 아래 JSON 하나로만 답하라. 코드펜스/설명 금지. 값은 모두 문자열:\n"
-        '{"topic": "slug 또는 none", "progress": "- ...", "resume": "...",\n'
+        "반드시 아래 JSON 하나로만 답하라. 코드펜스/설명 금지:\n"
+        '{"topic": "slug 또는 none", "topic_new": null, "progress": "- ...", "resume": "...",\n'
         '  "conclusions": [], "dropped": [], "tasks_add": []}\n\n'
         f"# 주제 목록\n{slug_list}\n\n"
         f"# 프로젝트\n{title}\n\n"
@@ -563,12 +572,31 @@ def _valid_summary(parsed):
             return None
     return {
         "topic": parsed.get("topic"),
+        "topic_new": _norm_topic_new(parsed.get("topic_new")),
         "conclusions": [str(x) for x in (parsed.get("conclusions") or []) if str(x).strip()],
         "dropped": [str(x) for x in (parsed.get("dropped") or []) if str(x).strip()],
         "progress": parsed.get("progress"),
         "resume": parsed.get("resume"),
         "tasks_add": _norm_adds(parsed.get("tasks_add")),
     }
+
+
+def _norm_topic_new(raw):
+    """{'slug','title'} 로 정규화. 슬러그는 파일명이 될 수 있어야 하므로 [a-z0-9-] 만 남긴다."""
+    if not isinstance(raw, dict):
+        return None
+    slug = re.sub(r"[^a-z0-9-]+", "-", str(raw.get("slug") or "").strip().lower()).strip("-")
+    if not slug:
+        return None
+    return {"slug": slug, "title": _safe_alias(raw.get("title")) or slug}
+
+
+def _safe_alias(s):
+    """위키링크 alias 로 넣어도 안전한 문자열. `[`·`]`·`|` 가 들어가면 링크가 그 자리에서 끊겨
+    **제목이 통째로 소실된다**(`_task_topic_alias` 파싱 실패). LLM 이 만드는 제목이라
+    `[긴급]` 같은 대괄호 태그가 실제로 들어온다."""
+    s = re.sub(r"[\[\]|]+", " ", str(s or "")).replace("\n", " ")
+    return re.sub(r"\s+", " ", s).strip()[:TASK_TITLE_MAX]
 
 
 def _norm_adds(raw):
@@ -619,13 +647,32 @@ def call_claude(prompt):
     }
 
 
-def summarize(meta, current_tasks, use_llm=True, choices=()):
+def _match_known(tn, known, threshold=0.75):
+    """신규 슬러그 제안을 **기존 전체 목록(완료 주제·파일 없는 슬러그 포함)** 과 대조한다.
+
+    선택지(프롬프트)에는 active/paused 만 준다 — 완료 주제를 선택지에 넣으면 요약기가 그것을 골라
+    되살리게 되고, 그것은 '완료 체크는 사람만 한다'를 훅이 깨는 것이다. 대조는 파이썬이 뒤에서만
+    한다(0토큰). 맞으면 기존 슬러그를 돌려주고, 아니면 None.
+    """
+    for slug, _ in known:
+        if slug == tn["slug"]:
+            return slug
+    best, bs = 0.0, None
+    for slug, title in known:
+        r = max(difflib.SequenceMatcher(None, _norm_line(tn["slug"]), _norm_line(slug)).ratio(),
+                difflib.SequenceMatcher(None, _norm_line(tn["title"]), _norm_line(title)).ratio())
+        if r > best:
+            best, bs = r, slug
+    return bs if best >= threshold else None
+
+
+def summarize(meta, current_tasks, use_llm=True, choices=(), known=()):
     """요약 결과. **LLM 호출 자체가 실패하면 None 을 준다** — 호출자가 마커를 전진시키지
     않고 다음 실행에 재시도하게 하기 위함이다. 오프라인에서 돌면 '(요약 실패)' 를 기록하고
     마커까지 전진해 그 구간이 영영 요약되지 않는 사고가 난다."""
     title = meta.get("title") or "세션"
     if not use_llm:
-        return {"topic": None, "conclusions": [], "dropped": [],
+        return {"topic": None, "topic_title": "", "conclusions": [], "dropped": [],
                 "progress": f"- [{title}] (dry-run)", "resume": "(dry-run)",
                 "tasks_add": [], "_usage": None, "_parts": {}}
     base_prompt, parts = build_summary_prompt(meta, current_tasks, choices)
@@ -648,8 +695,22 @@ def summarize(meta, current_tasks, use_llm=True, choices=()):
     elif choices and topic not in {sl for sl, _ in choices}:
         _debug(f"[worker] 미등록 슬러그 '{topic}' → none 처리")
         topic = None
+
+    # 매칭 실패 시: 제안된 이름표를 기존 목록과 대조해 구제하고, 아니면 그 이름표를 그대로 쓴다.
+    # 여기서 정해지는 슬러그에 **파일이 없을 수 있다** — 그건 주제가 아니라 목차의 묶음 키다.
+    topic_title = ""
+    if topic is None and valid.get("topic_new"):
+        tn = valid["topic_new"]
+        hit = _match_known(tn, known)
+        if hit:
+            topic, topic_title = hit, ""
+            _debug(f"[worker] 신규 제안 '{tn['slug']}' → 기존 '{hit}' 에 합침")
+        else:
+            topic, topic_title = tn["slug"], tn["title"]
+            _debug(f"[worker] 신규 묶음 키 '{topic}' ({topic_title}) — 주제 파일은 만들지 않는다")
     return {
         "topic": topic,
+        "topic_title": topic_title,
         "conclusions": valid["conclusions"],
         "dropped": valid["dropped"],
         "progress": valid["progress"] or "- (내용 없음)",
@@ -666,7 +727,10 @@ def _split_tasks(md):
     open_t, done_t = [], []
     for ln in (md or "").splitlines():
         s = ln.rstrip()
-        if TOPIC_LINE_RE.match(s):
+        # `**3.**` 은 머리줄(주제·묶음)이고 `**3-1**` 이 태스크다. 링크 유무와 무관하게 뺀다 —
+        # 묶음 줄에는 링크가 없어 TOPIC_LINE_RE 로는 안 걸리는데, 누가 raw 편집으로
+        # 체크박스를 붙이면 가짜 완료 태스크가 되어 완료 섹션·아카이브까지 흘러간다.
+        if HEADER_LINE_RE.match(s):
             continue
         low = s.lstrip().lower()
         if low.startswith("- [ ]"):
@@ -685,6 +749,9 @@ def _stamp_done(line, date_str):
 # 주제 줄: - [ ] **3.** [[topics/slug|제목]] …   (태스크는 **3-1** 이라 겹치지 않는다)
 TOPIC_LINE_RE = re.compile(
     r"^\s*-\s*\[([ xX])\]\s*\*\*(\d+)\.\*\*\s*\[\[" + re.escape(TOPICS_DIRNAME) + r"/([^\]|]+)")
+
+# 머리줄 전반(주제 줄 + 묶음 줄). 태스크는 `**3-1**` 이라 겹치지 않는다.
+HEADER_LINE_RE = re.compile(r"^\s*-\s*(?:\[[ xX]\]\s*)?\*\*\d+\.\*\*")
 
 NUM_RE = re.compile(r"^\s*(-\s*\[[ xX]\]\s*)(?:\*\*[0-9]+-[0-9]+\*\*\s*)?(.*)$")
 
@@ -753,10 +820,14 @@ def _find_task(lines, needle):
     return bi if best >= 0.6 else None
 
 
-def _apply_task_adds(open_cur, adds, topic, conv_link):
+def _apply_task_adds(open_cur, adds, topic, conv_link, topic_title=""):
     """새 태스크를 목록에 넣는다. after 가 가리키는 줄 **뒤에**, 못 찾으면 맨 뒤에.
 
-    기존 줄은 손대지 않는다 — LLM 은 추가분만 주므로 순서·태그·링크가 훼손될 수 없다."""
+    기존 줄은 손대지 않는다 — LLM 은 추가분만 주므로 순서·태그·링크가 훼손될 수 없다.
+
+    `topic_title` 은 **주제 파일이 없는 묶음**일 때만 채워진다. 그 경우 링크 alias 가
+    묶음 제목의 유일한 저장소다 — 목차는 매 렌더 다시 쓰이므로 제목을 둘 데가 여기뿐이다.
+    파일이 있는 주제는 렌더 시 파일에서 title 을 읽으므로 alias 는 🔧 로 둔다."""
     out = list(open_cur)
     for a in adds or []:
         text = a["text"]
@@ -765,7 +836,13 @@ def _apply_task_adds(open_cur, adds, topic, conv_link):
             continue
         line = f"- [ ] {text}"
         if topic:
-            line += f"  [[{TOPICS_DIRNAME}/{topic}|🔧]]"
+            # 제목이 안 넘어왔으면 **같은 슬러그의 기존 줄에서 물려받는다.**
+            # 요약기가 기존 묶음에 합칠 때는 제목을 다시 주지 않는데(`_match_known` 적중),
+            # 제목을 들고 있던 줄 하나가 완료되면 남은 줄이 전부 🔧 라서 묶음 제목이
+            # 슬러그로 퇴화한다. 모든 줄이 제목을 갖고 있으면 그 일이 생기지 않는다.
+            alias = _safe_alias(topic_title) or next(
+                (a for a in (_task_topic_alias(l) for l in out if _task_topic(l) == topic) if a), "")
+            line += f"  [[{TOPICS_DIRNAME}/{topic}|{alias or '🔧'}]]"
         if conv_link:
             line += f"  [[{conv_link}|↗ 대화]]"
         pos = _find_task(out, a.get("after"))
@@ -782,53 +859,64 @@ def _task_topic(line):
     return m.group(1).strip() if m else None
 
 
-def _find_task(lines, needle):
-    """`after` 로 지정된 문구와 같은 줄의 위치. 정규화 일치 → 부분 포함 → 유사도 순으로 찾는다."""
-    if not needle:
-        return None
-    n = _norm_line(needle)
-    keys = [_norm_line(re.sub(r"\[\[.*?\]\]", "", l)) for l in lines]
-    for i, k in enumerate(keys):
-        if k == n:
-            return i
-    for i, k in enumerate(keys):
-        if n and (n in k or k in n):
-            return i
-    best, bi = 0.0, None
-    for i, k in enumerate(keys):
-        r = difflib.SequenceMatcher(None, n, k).ratio()
-        if r > best:
-            best, bi = r, i
-    return bi if best >= 0.6 else None
+def _task_topic_alias(line):
+    """태스크 줄 링크의 alias. 파일 없는 묶음은 여기에 제목이 들어 있다(🔧 는 제목이 아니다)."""
+    m = re.search(r"\[\[" + re.escape(TOPICS_DIRNAME) + r"/[^|\]]+\|([^\]]*)\]\]", line)
+    a = (m.group(1).strip() if m else "")
+    return "" if a == "🔧" else a
 
 
-def _apply_task_adds(open_cur, adds, topic, conv_link):
-    """새 태스크를 목록에 넣는다. after 가 가리키는 줄 **뒤에**, 못 찾으면 맨 뒤에.
+# 링크 **대상**(`|` 앞)의 날짜만 잡는다. `conversations/<sid8>_2026-08-10` 과
+# 구설계 `2026-06-05_1334_..._sid8` 을 모두 잡되, `[^\]|]` 라서 `|` 를 넘지 못하므로
+# **alias(제목) 안의 날짜는 걸리지 않는다** — 제목에 "정산 마감 2099-12-31" 같은 말이 들어가면
+# 그것이 마지막 활동일로 둔갑한다. `✅ 2026-08-10` 완료 스탬프는 대괄호 밖이라 애초에 무관하다.
+LINK_DATE_RE = re.compile(r"\[\[[^\]|]*?(\d{4}-\d{2}-\d{2})")
 
-    기존 줄은 손대지 않는다 — LLM 은 추가분만 주므로 순서·태그·링크가 훼손될 수 없다."""
-    out = list(open_cur)
-    for a in adds or []:
-        text = a["text"]
-        if _dedup_against([text], [re.sub(r"\[\[.*?\]\]", "", l) for l in out]) == []:
-            _debug(f"[worker] 태스크 중복 — 건너뜀: {text[:40]}")
-            continue
-        line = f"- [ ] {text}"
-        if topic:
-            line += f"  [[{TOPICS_DIRNAME}/{topic}|🔧]]"
-        if conv_link:
-            line += f"  [[{conv_link}|↗ 대화]]"
-        pos = _find_task(out, a.get("after"))
-        if pos is None:
-            out.append(line)
-        else:
-            out.insert(pos + 1, line)
+# 방치 경고 임계값. 짧게 잡으면 대부분의 묶음이 상시 경고가 되어 신호가 죽고,
+# 90일(원안)은 두 달 넘게 조용하다. 한 달이면 되짚을 때가 됐다는 뜻이고
+# 완료 보관(14일)·아카이브 주기와도 겹치지 않는다.
+STALE_DAYS = 30
+
+
+def _last_activity(lines):
+    ds = [m.group(1) for l in lines for m in LINK_DATE_RE.finditer(l)]
+    return max(ds) if ds else None
+
+
+def _activity_mark(lines, today=None):
+    """묶음 줄 꼬리표: 마지막 활동일 + 방치 경과. 저장소가 필요 없다 —
+    파일 없는 묶음은 status 를 둘 곳이 없으므로 상태를 저장하는 대신 **계산해서 보여준다**."""
+    d = _last_activity(lines)
+    if not d:
+        return ""
+    out = f" · 마지막 활동 {d[5:]}"
+    try:
+        ref = datetime.strptime(today or datetime.now().strftime("%Y-%m-%d"), "%Y-%m-%d")
+        days = (ref - datetime.strptime(d, "%Y-%m-%d")).days
+    except ValueError:
+        return out
+    return out + (f" · ⚠ {days}일째" if days >= STALE_DAYS else "")
+
+
+def _known_topics(base, open_lines=()):
+    """유사도 대조용 (slug, title) **전체** 목록.
+
+    `_topic_choices` 와 다르다 — 저쪽은 요약기에게 주는 선택지라 완료 주제를 뺀다.
+    이쪽은 파이썬이 뒤에서 대조만 하므로 완료 주제와 **파일 없이 태스크에만 심긴 슬러그**까지
+    넣는다. 그래야 ① 완료 주제와 같은 일이 새 이름으로 갈라지지 않고
+    ② 같은 묶음이 세션마다 다른 슬러그를 얻지 않는다."""
+    d = os.path.join(base, TOPICS_DIRNAME)
+    out, seen = [], set()
+    for slug in _topic_slugs(base):
+        m = _topic_meta(os.path.join(d, f"{slug}.md"))
+        out.append((slug, m.get("title") or slug))
+        seen.add(slug)
+    for l in open_lines or ():
+        s = _task_topic(l)
+        if s and s not in seen:
+            out.append((s, _task_topic_alias(l) or s))
+            seen.add(s)
     return out
-
-
-def _task_topic(line):
-    """태스크 줄에 심긴 주제 슬러그."""
-    m = re.search(r"\[\[" + re.escape(TOPICS_DIRNAME) + r"/([^|\]]+)", line)
-    return m.group(1).strip() if m else None
 
 
 def _count_tasks(md):
@@ -976,16 +1064,32 @@ def _render_turns(turns):
     return "\n".join(out).rstrip() + "\n"
 
 
-def _write_conversation_page(base, sid8, date, turns, title=None, progress=None, topic=None):
+def _conv_head(progress, conclusions=(), dropped=()):
+    """대화 페이지 머리말. 주제 파일이 없는 세션에서는 **여기가 결론의 유일한 착지점**이다 —
+    `_append_topic` 이 호출되지 않으면 요약기가 뽑아둔 결론·접은 안이 그대로 버려진다."""
+    out = []
+    if progress:
+        out.append(f"## 📈 이날 진행\n\n{progress.rstrip()}\n")
+    for header, items in ((CONCLUSION_HEADER, conclusions), (DROPPED_HEADER, dropped)):
+        if items:
+            out.append(header + "\n\n" + "\n".join(f"- {x}" for x in items) + "\n")
+    return "\n".join(out) + "\n" if out else ""
+
+
+def _write_conversation_page(base, sid8, date, turns, title=None, progress=None, topic=None,
+                             conclusions=(), dropped=()):
     """그날 대화 원문. 세션 허브를 두지 않으므로 진행 요약도 여기 얹는다
     (주제가 잡힌 세션은 topics/ 가 정본이고, 여기 요약은 대화를 여는 사람용 머리말)."""
     d = os.path.join(base, CONV_DIRNAME)
     os.makedirs(d, exist_ok=True)
     path = os.path.join(d, f"{sid8}_{date}.md")
     body = _render_turns(turns)
+    head_extra = _conv_head(progress, conclusions, dropped)
     if os.path.exists(path):
+        # 같은 날 두 번째 flush. 머리말을 다시 실어 중간에 헤더가 반복되지만,
+        # 빼면 두 번째 증분에서 나온 결론이 유실된다 — 중복이 유실보다 낫다.
         with open(path, "a", encoding="utf-8") as f:
-            f.write("\n" + body)
+            f.write("\n" + head_extra + body)
         return
     # title frontmatter: Front Matter Title 플러그인이 파일명 대신 표시
     disp = f"{title or topic or '대화'} · {date}"
@@ -994,8 +1098,7 @@ def _write_conversation_page(base, sid8, date, turns, title=None, progress=None,
         f.write(head)
         if topic:
             f.write(f"> 주제: [[{TOPICS_DIRNAME}/{topic}]]\n\n")
-        if progress:
-            f.write(f"## 📈 이날 진행\n\n{progress.rstrip()}\n\n")
+        f.write(head_extra)
         f.write(f"# 💬 {date} 대화\n\n" + body)
 
 
@@ -1118,6 +1221,23 @@ def _topic_choices(base):
     return out
 
 
+def _fm_list(txt, key):
+    """frontmatter 의 `key: [a, b]` 를 리스트로. 없으면 [].
+
+    스칼라(`key: a`)도 받는다 — 못 읽으면 []를 주고 호출부가 그 위에 덮어써서
+    **기존 값이 조용히 사라진다.** 사람이 손으로 적으면 스칼라가 되기 쉽다."""
+    m = re.match(r"^---\n(.*?)\n---\n", txt, re.S)
+    if not m:
+        return []
+    mm = re.search(rf"^{re.escape(key)}:\s*(.*?)\s*$", m.group(1), re.M)
+    if not mm:
+        return []
+    v = mm.group(1).strip()
+    if v.startswith("[") and v.endswith("]"):
+        v = v[1:-1]
+    return [x.strip().strip("\"'") for x in v.split(",") if x.strip()]
+
+
 def _fm_set(txt, key, value):
     m = re.match(r"^---\n(.*?)\n---\n", txt, re.S)
     if not m:
@@ -1131,7 +1251,7 @@ def _fm_set(txt, key, value):
 
 
 def _append_topic(base, slug, date, sid8, progress, next_step,
-                  conclusions=(), dropped=()):
+                  conclusions=(), dropped=(), cwd=None):
     """주제 파일의 📈 진행 로그에 prepend + frontmatter 갱신.
     파일이 없으면 만들지 않는다 — 신규 주제 생성은 사용자 지시로만(결정 E)."""
     path = os.path.join(base, TOPICS_DIRNAME, f"{slug}.md")
@@ -1182,6 +1302,13 @@ def _append_topic(base, slug, date, sid8, progress, next_step,
             txt = f"{head}\n\n{block}\n\n{tail}"
 
     txt = _fm_set(txt, "updated", date)
+    # 작업 경로 — 이어서 하려면 어디로 cd 할지가 필요한데 지금은 `plan:` 이 있는 주제만 알 수 있다.
+    # cwd 는 파이썬이 이미 아는 값이라 0토큰이다. 한 주제가 여러 repo 에 걸치므로 누적한다.
+    if cwd:
+        repo = cwd.rstrip("/").split("/")[-1]
+        cur = _fm_list(txt, "repos")
+        if repo and repo != "?" and repo not in cur:
+            txt = _fm_set(txt, "repos", "[" + ", ".join(cur + [repo]) + "]")
     if next_step:
         # '다음'의 정본은 '## 🔜 다음' 섹션 하나다 (_topic_meta 가 여기서 읽는다).
         # frontmatter 에 next 를 중복 기록하지 않는다.
@@ -1270,7 +1397,7 @@ def _write_index(base, open_lines=None, done_lines=None):
            "> 주제·할 일 목차. **체크박스만 직접 건드리세요** — 나머지는 세션 종료 시 다시 씁니다.",
            "> 주제를 체크하면 그 주제가 닫히고(`status: done`) 목록에서 빠집니다.", "",
            "## 🔧 진행 중인 주제", ""]
-    active, paused = [], []
+    active, paused, n = [], [], 0
     for n, (slug, m, st) in enumerate(_topic_order(base), 1):
         mine = by_topic.pop(slug, [])
         line = f"- [ ] **{n}.** [[{TOPICS_DIRNAME}/{slug}|{m.get('title') or slug}]] `{st}`"
@@ -1283,13 +1410,25 @@ def _write_index(base, open_lines=None, done_lines=None):
         for j, l in enumerate(mine, 1):
             line += "\n\t" + _numbered(l, f"{n}-{j}")
         (paused if st == "paused" else active).append(line)
-    # 끝난(done) 주제나 사라진 슬러그에 달린 태스크는 흘려보내지 않고 기타로 모은다
-    for left in by_topic.values():
-        orphan += left
+    # 남은 슬러그 = 주제 파일이 없거나 완료된 것. 낱개로 흘려보내지 않고 **묶음으로** 렌더한다.
+    # 묶음 줄에는 체크박스를 두지 않는다 — 파일이 없어 '묶음 완료' 상태를 저장할 곳이 없고,
+    # 체크를 두면 다음 렌더에서 조용히 사라진다. 하위 태스크 체크는 주제와 동일하게 동작한다.
+    # 하위가 전부 완료되면 그 슬러그에 미완료가 0개가 되어 묶음 줄 자체가 사라진다.
+    groups = []
+    for slug in sorted(by_topic, key=lambda s: _last_activity(by_topic[s]) or "", reverse=True):
+        mine = by_topic[slug]
+        n += 1
+        tp = os.path.join(d, f"{slug}.md")
+        title = (_topic_meta(tp).get("title") if os.path.exists(tp) else "") \
+            or next((a for a in (_task_topic_alias(l) for l in mine) if a), "") or slug
+        g = f"- **{n}.** {title} · 남은 일 {len(mine)}{_activity_mark(mine)}"
+        for j, l in enumerate(mine, 1):
+            g += "\n\t" + _numbered(l, f"{n}-{j}")
+        groups.append(g)
 
     out += active or ["_(없음)_"]
-    if orphan:
-        out += ["", "## ☑️ 기타 태스크", ""] + [_numbered(l, None) for l in orphan]
+    if groups or orphan:
+        out += ["", "## ☑️ 기타 태스크", ""] + groups + [_numbered(l, None) for l in orphan]
     if paused:  # 지금 손대지 않는 것이므로 아래로
         out += ["", "## ⏸ 보류", ""] + paused
     out += ["", TASKS_DONE_HEADER, "",
@@ -1396,7 +1535,10 @@ def _process(transcript, base=None, db_path=DB_FILE, use_llm=True):
             processed_upto, done_groups = processed, 0
             for date, dturns in groups:
                 dmeta = {**meta, "turns": dturns}
-                summary = summarize(dmeta, "\n".join(open_cur), use_llm=use_llm, choices=choices)
+                # known 은 루프 안에서 다시 만든다 — 앞 날짜가 만든 묶음 키를 뒤 날짜가 재사용해야
+                # 한 세션이 며칠에 걸쳐도 같은 묶음으로 모인다.
+                summary = summarize(dmeta, "\n".join(open_cur), use_llm=use_llm,
+                                    choices=choices, known=_known_topics(base, open_cur))
                 if summary is None:
                     # LLM 호출 실패(오프라인·타임아웃 등). 여기서 멈추고 **마커를 전진시키지 않는다** —
                     # 그래야 다음 실행(자정 flush 등)이 이 구간을 다시 요약한다.
@@ -1405,14 +1547,21 @@ def _process(transcript, base=None, db_path=DB_FILE, use_llm=True):
                 last_summary = summary
                 prog = summary["progress"].rstrip()
                 topic = summary.get("topic")
+                topic_title = summary.get("topic_title") or ""
+                # topic 에 대응하는 파일이 없으면 on_topic 은 False 다 — 그건 주제가 아니라
+                # 목차의 묶음 키이고, 진행 로그·결론은 대화 페이지가 받는다.
                 on_topic = bool(topic) and _append_topic(
                     base, topic, date, sid8, prog, summary["resume"],
-                    summary.get("conclusions"), summary.get("dropped"))
+                    summary.get("conclusions"), summary.get("dropped"), cwd=meta.get("cwd"))
                 # 주제에 붙었으면 진행 로그 정본은 topics/ 다. 대화 페이지에는 머리말로만 얹는다.
-                _write_conversation_page(base, sid8, date, dturns, meta.get("title"),
-                                         None if on_topic else prog, topic if on_topic else None)
+                _write_conversation_page(
+                    base, sid8, date, dturns, meta.get("title"),
+                    None if on_topic else prog, topic if on_topic else None,
+                    conclusions=() if on_topic else summary.get("conclusions"),
+                    dropped=() if on_topic else summary.get("dropped"))
                 last_conv = f"{CONV_DIRNAME}/{sid8}_{date}"
-                _append_daily(base, date, topic if on_topic else project,
+                # daily 라벨은 묶음 키까지 쓴다 — cwd 폴백은 한 주제가 여러 repo 에 걸치면 어긋난다.
+                _append_daily(base, date, topic or project,
                               summary["progress"],
                               f"{TOPICS_DIRNAME}/{topic}" if on_topic else last_conv)
                 _log_usage(db_path, sid, date, topic, summary.get("_parts") or {}, summary.get("_usage"))
@@ -1421,7 +1570,8 @@ def _process(transcript, base=None, db_path=DB_FILE, use_llm=True):
                 # '#완료' 면 open_cur 를 그대로 둔다 — 기존 목록이 다시 쓰여 신규가 안 생긴다.
                 if not task_skip:
                     open_cur = _apply_task_adds(open_cur, summary.get("tasks_add"),
-                                                topic if on_topic else None, last_conv)
+                                                topic, last_conv,
+                                                "" if on_topic else topic_title)
                 processed_upto += len(dturns)
                 done_groups += 1
                 _debug(f"[worker] {date}: topic={topic or 'none'} 진행 로그·대화·데일리 기록")
@@ -1486,8 +1636,26 @@ def _trim_launchd_logs():
             pass
 
 
+def _is_summarizer_session(meta):
+    """요약기 자신의 `claude -p` 세션인가.
+
+    SessionEnd 경로는 `GUARD_ENV` 로 걸러지지만 `--catchup` 은 트랜스크립트를 직접 훑으므로
+    그 방어가 닿지 않는다. 요약 프롬프트는 12,000자짜리 user 발화로 파싱되어 `is_significant`
+    를 통과하고, 그대로 두면 프롬프트에 담긴 미완료 태스크 목록이 다시 태스크로 돌아온다.
+    `type == "queue-operation"` 은 판별에 쓸 수 없다 — 실제 대화 세션에도 섞여 있다."""
+    for role, lines, _ in meta.get("turns") or ():
+        if role != "user":
+            continue
+        return "\n".join(lines).lstrip().startswith(SUMMARY_SIGNATURE)
+    return False
+
+
 def _catchup():
     """열려 있는(=최근 수정된) 세션들을 SessionEnd 와 똑같이 기록한다. 세션 자체는 건드리지 않는다.
+
+    **자동 실행은 없다.** 자정 launchd 잡은 제거했다 — `~/Documents` 가 macOS 보호 폴더라
+    백그라운드 launchd 프로세스가 TCC 로 조용히 거부당했고(실측 3회 전량 실패, 기록 0건),
+    SessionEnd 만으로 빠짐이 없음을 확인했기 때문이다. 이 함수는 수동 실행용으로만 남는다.
 
     증분 마커가 있어 이미 처리된 세션은 즉시 스킵되므로 '열림' 여부를 정확히 가릴 필요가 없다.
     LLM 호출이 실패하면 _process 가 마커를 전진시키지 않으므로 다음 실행이 그대로 재시도한다."""
@@ -1495,8 +1663,17 @@ def _catchup():
     root = os.path.expanduser("~/.claude/projects")
     files = [f for f in glob.glob(os.path.join(root, "*", "*.jsonl"))
              if os.path.getmtime(f) >= cutoff]
-    _debug(f"[catchup] 대상 {len(files)}개 (최근 {CATCHUP_DAYS}일)")
-    for f in sorted(files, key=os.path.getmtime):
+    todo, skipped = [], 0
+    for f in files:
+        try:
+            if _is_summarizer_session(parse_transcript(f)):
+                skipped += 1
+                continue
+        except Exception:
+            pass
+        todo.append(f)
+    _debug(f"[catchup] 대상 {len(todo)}개 (최근 {CATCHUP_DAYS}일, 요약기 세션 {skipped}개 제외)")
+    for f in sorted(todo, key=os.path.getmtime):
         _process(f)
     _trim_launchd_logs()
     _debug("[catchup] 완료")
