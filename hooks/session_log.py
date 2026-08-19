@@ -30,6 +30,7 @@ import fcntl
 import difflib
 import sqlite3
 import contextlib
+import shlex
 import subprocess
 from datetime import datetime, timedelta
 
@@ -1545,7 +1546,9 @@ def _write_index(base, open_lines=None, done_lines=None):
     active, paused, n = [], [], 0
     for n, (slug, m, st) in enumerate(_topic_order(base), 1):
         mine = by_topic.pop(slug, [])
-        line = f"- [ ] **{n}.** [[{TOPICS_DIRNAME}/{slug}|{m.get('title') or slug}]]"
+        # 제목의 ] · | 는 위키링크 문법을 깨므로 치환한다
+        disp = re.sub(r"[\[\]|]", "·", m.get("title") or slug)
+        line = f"- [ ] **{n}.** [[{TOPICS_DIRNAME}/{slug}|{disp}]]"
         # 언제·어디서 하던 일인가 — 재개 판단에 제목보다 먼저 필요한 정보다.
         bits = [x for x in (_ago(m.get("updated") or m.get("created")),
                             os.path.basename(m.get("cwd") or "") or None) if x]
@@ -1569,18 +1572,20 @@ def _write_index(base, open_lines=None, done_lines=None):
             # 만료됐을 때도 **그대로 실행되는** 명령을 준다. "파일을 읽혀서 재개하라"는
             # 안내문은 사람이 다시 조립해야 하므로 재개 경로가 아니다.
             # cd 한 뒤 실행되므로 vault 는 절대경로 + --add-dir 로 접근 권한을 미리 준다.
+            # 경로·문구는 전부 shlex 로 인용한다. 제목이나 plan 경로에 따옴표·백틱·공백·$ 가
+            # 들어가면 그대로 복사한 명령이 깨진다(실측: bash -n 구문 오류).
             docs = os.path.join(base, TOPICS_DIRNAME, f"{slug}.md")
             if m.get("plan"):
                 docs += f" 와 {m['plan']}"
             boot = (f"{docs} 를 읽고, 기록 시점과 지금 git 상태의 차이를 먼저 보고한 뒤 "
                     f"남은 일부터 이어서 하자")
             ws = _workspaces(m)
-            extra = " ".join(f"--add-dir {w}" for w, _ in ws if w != cwd)
+            extra = " ".join(f"--add-dir {shlex.quote(w)}" for w, _ in ws if w != cwd)
             if _resumable(sess):
-                line += f"\n  ↳ `cd {cwd} && claude -r {sess}`"
+                line += f"\n  ↳ `cd {shlex.quote(cwd)} && claude -r {shlex.quote(sess)}`"
             else:
-                line += (f"\n  ↳ `cd {cwd} && claude --add-dir {base}"
-                         f"{' ' + extra if extra else ''} '{boot}'`  (원본 만료)")
+                line += (f"\n  ↳ `cd {shlex.quote(cwd)} && claude --add-dir {shlex.quote(base)}"
+                         f"{' ' + extra if extra else ''} {shlex.quote(boot)}`  (원본 만료)")
             # 저장소 상태 경고 — workspace 마다 따로 잰다
             warns, nobase = [], ""
             for wpath, whead in ws:
@@ -1634,7 +1639,12 @@ def _write_index(base, open_lines=None, done_lines=None):
         out += ["", "## ⏸ 보류", ""] + paused
     out += ["", TASKS_DONE_HEADER, "",
             f"> {DONE_RETAIN_DAYS}일이 지나면 [[{os.path.splitext(ARCHIVE_FILENAME)[0]}]] 로 옮겨집니다.", ""]
-    out += [_numbered(l, None) for l in done_lines] if done_lines else ["_(완료 항목 없음)_"]
+    if done_lines:
+        out += [f"<details><summary>{len(done_lines)}건 — 펼치기</summary>", ""]
+        out += [_numbered(l, None) for l in done_lines]
+        out += ["", "</details>"]
+    else:
+        out += ["_(완료 항목 없음)_"]
     _safe_write_index(path, "\n".join(out).rstrip() + "\n")
 
 
