@@ -426,6 +426,22 @@ def _yaml_val(v):
     return '"' + str(v).replace("\n", " ").replace('"', "'") + '"'
 
 
+def _git_state(cwd):
+    """그 세션이 돌던 시점의 branch·HEAD. 재개할 때 **코드 드리프트**를 재는 기준점이다.
+    12일 뒤에 돌아오면 세션 맥락보다 '그 사이 코드가 얼마나 변했나'가 더 중요하다."""
+    if not cwd or not os.path.isdir(cwd):
+        return None, None
+    def run(*a):
+        try:
+            r = subprocess.run(["git", "-C", cwd, *a], capture_output=True, text=True, timeout=10)
+            return r.stdout.strip() if r.returncode == 0 else None
+        except Exception:
+            return None
+    br = run("rev-parse", "--abbrev-ref", "HEAD")
+    head = run("rev-parse", "--short", "HEAD")
+    return (br if br and br != "HEAD" else None), head
+
+
 def _project_of(meta):
     return (meta.get("cwd") or "?").rstrip("/").split("/")[-1] or "?"
 
@@ -525,6 +541,9 @@ def build_summary_prompt(meta, current_tasks, choices=()):
   · 주제의 다음 단계도 포함한다 — 순서대로 체크해 나가면 되고, 체크박스여야 완료 이력이 남는다.
     순서가 있으면 제목 앞에 ① ② ③ 를 붙여라.
   · 이미 목록에 있는 것과 같은 일이면 넣지 마라. 새로 생긴 게 없으면 [] 로 두어라.
+- verified: 이번에 **실제로 확인·검증된 것** 한 줄. 테스트를 돌렸는지, 배포했는지, 코드만 짜고 안 돌렸는지.
+  · "dry-run 통과, 실제 적용 안 함" 처럼 **어디까지 확실한지**를 적어라. 재개할 때 이것부터 본다.
+  · 확인한 게 없으면 "" 로 두어라. 지어내지 마라.
 - conclusions: **다음에 같은 작업을 할 때 몰랐으면 헤맬 사실**만 배열로. 수치·조건·이유를 담아라.
   · 이번에 무엇을 했는지는 progress 의 몫이다. 여기 쓰지 마라.
   · 해당 없으면 [] 로 두어라. 억지로 만들지 마라.
@@ -536,6 +555,7 @@ def build_summary_prompt(meta, current_tasks, choices=()):
         f"{instructions}\n\n"
         "반드시 아래 JSON 하나로만 답하라. 코드펜스/설명 금지:\n"
         '{"topic": "slug 또는 none", "topic_new": null, "progress": "- ...", "resume": "...",\n'
+        '  "verified": "...",\n'
         '  "conclusions": [], "dropped": [], "tasks_add": []}\n\n'
         f"# 주제 목록\n{slug_list}\n\n"
         f"# 프로젝트\n{title}\n\n"
@@ -562,7 +582,7 @@ def _extract_json(text):
 def _valid_summary(parsed):
     if not isinstance(parsed, dict):
         return None
-    for k in ("topic", "progress", "resume"):
+    for k in ("topic", "progress", "resume", "verified"):
         v = parsed.get(k)
         if v is not None and not isinstance(v, str):
             return None
@@ -577,6 +597,7 @@ def _valid_summary(parsed):
         "dropped": [str(x) for x in (parsed.get("dropped") or []) if str(x).strip()],
         "progress": parsed.get("progress"),
         "resume": parsed.get("resume"),
+        "verified": parsed.get("verified"),
         "tasks_add": _norm_adds(parsed.get("tasks_add")),
     }
 
@@ -673,7 +694,7 @@ def summarize(meta, current_tasks, use_llm=True, choices=(), known=()):
     title = meta.get("title") or "세션"
     if not use_llm:
         return {"topic": None, "topic_title": "", "conclusions": [], "dropped": [],
-                "progress": f"- [{title}] (dry-run)", "resume": "(dry-run)",
+                "progress": f"- [{title}] (dry-run)", "resume": "(dry-run)", "verified": "",
                 "tasks_add": [], "_usage": None, "_parts": {}}
     base_prompt, parts = build_summary_prompt(meta, current_tasks, choices)
     nudge = "\n\n[중요] 직전 응답이 형식에 안 맞았다. JSON 객체 하나만 출력하라."
@@ -715,6 +736,7 @@ def summarize(meta, current_tasks, use_llm=True, choices=(), known=()):
         "dropped": valid["dropped"],
         "progress": valid["progress"] or "- (내용 없음)",
         "resume": valid["resume"] or "(다음 미기재)",
+        "verified": (valid.get("verified") or "").strip(),
         "tasks_add": valid["tasks_add"],
         "_usage": usage,
         "_parts": parts,
@@ -1181,7 +1203,8 @@ def _append_section(txt, header, items):
 
 def _topic_meta(path):
     """frontmatter(status/title/plan) + '🔜 다음' 첫 줄."""
-    meta = {"status": "active", "title": "", "next": "", "plan": ""}
+    meta = {"status": "active", "title": "", "next": "", "plan": "", "updated": "", "created": "",
+            "cwd": "", "branch": "", "head": "", "session": "", "verified": "", "verified_head": "", "workspaces": "", "repos": ""}
     try:
         txt = open(path, encoding="utf-8").read()
     except OSError:
@@ -1191,7 +1214,8 @@ def _topic_meta(path):
         for ln in m.group(1).splitlines():
             k, _, v = ln.partition(":")
             k, v = k.strip(), v.strip().strip('"')
-            if k in ("status", "title", "plan"):
+            if k in ("status", "title", "plan", "updated", "created",
+                     "cwd", "branch", "head", "session", "verified", "verified_head", "workspaces", "repos"):
                 meta[k] = v
     i = txt.find(NEXT_HEADER)
     if i != -1:
@@ -1251,7 +1275,7 @@ def _fm_set(txt, key, value):
 
 
 def _append_topic(base, slug, date, sid8, progress, next_step,
-                  conclusions=(), dropped=(), cwd=None):
+                  conclusions=(), dropped=(), cwd=None, session_id=None, verified=None):
     """주제 파일의 📈 진행 로그에 prepend + frontmatter 갱신.
     파일이 없으면 만들지 않는다 — 신규 주제 생성은 사용자 지시로만(결정 E)."""
     path = os.path.join(base, TOPICS_DIRNAME, f"{slug}.md")
@@ -1302,6 +1326,26 @@ def _append_topic(base, slug, date, sid8, progress, next_step,
             txt = f"{head}\n\n{block}\n\n{tail}"
 
     txt = _fm_set(txt, "updated", date)
+    # ── 인계 패킷 ────────────────────────────────────────────────────
+    # 재개에 필요한 것은 "어느 세션이었나"보다 "어디서·어떤 코드 상태에서 하던 일인가"다.
+    if cwd:
+        txt = _fm_set(txt, "cwd", cwd)
+        br, head = _git_state(cwd)
+        if br:
+            txt = _fm_set(txt, "branch", br)
+        if head:
+            txt = _fm_set(txt, "head", head)
+    if session_id:
+        txt = _fm_set(txt, "session", session_id)      # 마지막 세션 full id — resume 대상
+    if verified:
+        txt = _fm_set(txt, "verified", _yaml_val(verified))
+        # 검증은 특정 코드 상태에 대한 것이다. dirty 면 그 HEAD 가 검증 대상을 대표하지 못한다.
+        _, vh = _git_state(cwd) if cwd else (None, None)
+        dirty = any("미커밋" in w for w in _repo_warnings(cwd)) if cwd else True
+        if vh and not dirty:
+            txt = _fm_set(txt, "verified_head", vh)
+        else:
+            txt = re.sub(r"^verified_head:.*\n", "", txt, count=1, flags=re.M)
     # 작업 경로 — 이어서 하려면 어디로 cd 할지가 필요한데 지금은 `plan:` 이 있는 주제만 알 수 있다.
     # cwd 는 파이썬이 이미 아는 값이라 0토큰이다. 한 주제가 여러 repo 에 걸치므로 누적한다.
     if cwd:
@@ -1350,6 +1394,98 @@ def _sync_topic_status(base):
         _debug(f"[worker] topics/{m.group(3)}: status → done (INDEX 체크)")
 
 
+def _resumable(session_id):
+    """원본 트랜스크립트가 아직 있는가. 30일이 지나면 지워져 --resume 이 불가능하다."""
+    if not session_id:
+        return False
+    pat = os.path.expanduser(f"~/.claude/projects/*/{session_id}.jsonl")
+    return bool(glob.glob(pat))
+
+
+def _ago(datestr):
+    """'오늘 · 어제 · 5일 전 · 3주 전'. 절대 날짜보다 판단이 빠르다."""
+    try:
+        d = datetime.strptime(datestr, "%Y-%m-%d").date()
+    except Exception:
+        return ""
+    n = (datetime.now().date() - d).days
+    if n <= 0: return "오늘"
+    if n == 1: return "어제"
+    if n < 14: return f"{n}일 전"
+    if n < 60: return f"{n // 7}주 전"
+    return f"{n // 30}개월 전"
+
+
+def _repo_warnings(path, branch=None, head=None, label=None):
+    """재개 전에 알아야 할 저장소 상태를 경고 목록으로. **'변화 없음'과 '측정 불가'를 구분한다.**
+
+    기준 HEAD 가 없으면 0커밋이 아니라 '판정 불가'다 — 없는 확신을 만들지 않기 위함이다.
+    """
+    out = []
+    tag = f"{label}: " if label else ""
+    if not (path and os.path.isdir(path)):
+        return [f"{tag}경로 없음"]
+    def git(*a):
+        try:
+            return subprocess.run(["git", "-C", path, *a], capture_output=True, text=True, timeout=10)
+        except Exception:
+            return None
+    cur_br = git("rev-parse", "--abbrev-ref", "HEAD")
+    cur_br = cur_br.stdout.strip() if cur_br and cur_br.returncode == 0 else None
+    if branch and cur_br and branch != cur_br:
+        out.append(f"{tag}브랜치 {branch}→{cur_br}")
+    if not head:
+        out.append(f"{tag}기록 HEAD 없음 — 변경 판정 불가")
+    else:
+        ok = git("cat-file", "-e", f"{head}^{{commit}}")
+        if not ok or ok.returncode != 0:
+            out.append(f"{tag}기록 커밋 없음 — 판정 불가")
+        else:
+            anc = git("merge-base", "--is-ancestor", head, "HEAD")
+            if anc is None:
+                out.append(f"{tag}판정 불가")
+            elif anc.returncode != 0:
+                out.append(f"{tag}브랜치 분기됨")
+            else:
+                r = git("rev-list", "--count", f"{head}..HEAD")
+                if r and r.returncode == 0 and r.stdout.strip().isdigit():
+                    n = int(r.stdout.strip())
+                    if n:
+                        out.append(f"{tag}그 뒤 {n}커밋")
+    st = git("status", "--porcelain")
+    if st and st.returncode == 0 and st.stdout.strip():
+        out.append(f"{tag}미커밋 변경 있음")
+    return out
+
+
+def _workspaces(m):
+    """주제가 걸친 저장소들 → [(path, head)].
+
+    한 주제가 여러 repo 를 오가면(nl2sql-slack = data-nl2sql + data-dbt) cwd 하나만
+    검사해서는 다른 repo 의 변화를 놓친다. cwd 자체가 git 저장소가 아닐 수도 있다
+    (day1 처럼 여러 repo 를 담은 상위 폴더) — 그때는 repos 에 적힌 하위 저장소를 본다.
+    """
+    cwd = (m.get("cwd") or "").rstrip("/")
+    out, seen = [], set()
+
+    def add(path, sha=None):
+        path = (path or "").rstrip("/")
+        if path and path not in seen and os.path.isdir(os.path.join(path, ".git")):
+            seen.add(path)
+            out.append((path, sha or None))
+
+    add(cwd, m.get("head"))                      # cwd 가 저장소면 그것이 기준
+    for src in (m.get("workspaces"), m.get("repos")):
+        for item in re.findall(r"[^\s,\[\]]+", src or ""):
+            name, _, sha = item.partition("@")
+            if name.startswith("/"):
+                add(name, sha)
+            else:
+                add(os.path.join(cwd, name), sha)                     # cwd 하위
+                add(os.path.join(os.path.dirname(cwd), name), sha)    # cwd 형제
+    return out
+
+
 def _topic_order(base):
     """진행 중 주제를 표시 순서대로. INDEX 와 작업현황이 **같은 번호**를 쓰게 하려면
     순서를 한 곳에서 정해야 한다. 두 파일이 다른 순서를 내면 5-2 를 보고 찾아갈 수 없다."""
@@ -1360,6 +1496,8 @@ def _topic_order(base):
         st = m.get("status") or "active"
         if st != "done":
             entries.append((slug, m, st))
+    # 최근 활동 역순. 이어서 할 것은 대개 최근 것이므로 알파벳 순은 찾는 비용만 만든다.
+    entries.sort(key=lambda e: (e[1].get("updated") or e[1].get("created") or ""), reverse=True)
     entries.sort(key=lambda e: e[2] == "paused")   # 보류는 뒤로 (stable)
     return entries
 
@@ -1400,13 +1538,65 @@ def _write_index(base, open_lines=None, done_lines=None):
     active, paused, n = [], [], 0
     for n, (slug, m, st) in enumerate(_topic_order(base), 1):
         mine = by_topic.pop(slug, [])
-        line = f"- [ ] **{n}.** [[{TOPICS_DIRNAME}/{slug}|{m.get('title') or slug}]] `{st}`"
-        # 태스크가 있으면 그것이 곧 '다음'이다. 🔜 다음 을 함께 실으면 같은 말이 두 번 나온다.
-        line += f" · 남은 일 {len(mine)}" if mine else f" — {m.get('next') or '_(다음 미기재)_'}"
-        # 설계 문서 포인터는 **지시문**으로 둔다. "그쪽에 있다"로 끝나는 서술문은
-        # 읽을지 여부를 읽는 쪽 판단에 맡기므로 전달이 보장되지 않는다.
-        if m.get("plan"):
-            line += f"\n  📄 먼저 `{m['plan']}` 를 읽어라. 전역 결정·기각 이력은 그쪽에 있다."
+        line = f"- [ ] **{n}.** [[{TOPICS_DIRNAME}/{slug}|{m.get('title') or slug}]]"
+        # 언제·어디서 하던 일인가 — 재개 판단에 제목보다 먼저 필요한 정보다.
+        bits = [x for x in (_ago(m.get("updated") or m.get("created")),
+                            os.path.basename(m.get("cwd") or "") or None) if x]
+        if st == "paused":
+            bits.append("보류")
+        if bits:
+            line += " · " + " · ".join(bits)
+        line += f" · 남은 일 {len(mine)}" if mine else ""
+        if not mine and m.get("next"):
+            line += f" — {m['next']}"
+        # 재개 한 줄. 원본이 30일 지나 지워졌으면 문서 재개로 안내한다.
+        sess, cwd = m.get("session"), m.get("cwd")
+        if not cwd and m.get("plan"):
+            # cwd 가 없으면 plan 이 있는 저장소를 시작 위치로 삼는다 — 명령이 아예 없는 것보다 낫다
+            d = os.path.dirname(m["plan"])
+            while d and d != "/" and not os.path.isdir(os.path.join(d, ".git")):
+                d = os.path.dirname(d)
+            cwd = d if d and d != "/" else None
+        if cwd:
+            # 만료됐을 때도 **그대로 실행되는** 명령을 준다. "파일을 읽혀서 재개하라"는
+            # 안내문은 사람이 다시 조립해야 하므로 재개 경로가 아니다.
+            # cd 한 뒤 실행되므로 vault 는 절대경로 + --add-dir 로 접근 권한을 미리 준다.
+            docs = os.path.join(base, TOPICS_DIRNAME, f"{slug}.md")
+            if m.get("plan"):
+                docs += f" 와 {m['plan']}"
+            boot = (f"{docs} 를 읽고, 기록 시점과 지금 git 상태의 차이를 먼저 보고한 뒤 "
+                    f"남은 일부터 이어서 하자")
+            ws = _workspaces(m)
+            extra = " ".join(f"--add-dir {w}" for w, _ in ws if w != cwd)
+            if _resumable(sess):
+                line += f"\n  ↳ `cd {cwd} && claude -r {sess}`"
+            else:
+                line += (f"\n  ↳ `cd {cwd} && claude --add-dir {base}"
+                         f"{' ' + extra if extra else ''} '{boot}'`  (원본 만료)")
+            # 저장소 상태 경고 — workspace 마다 따로 잰다
+            warns, nobase = [], ""
+            for wpath, whead in ws:
+                for w in _repo_warnings(wpath, m.get("branch") if wpath == cwd else None,
+                                        whead, os.path.basename(wpath) if len(ws) > 1 else None):
+                    if "기록 HEAD 없음" in w:
+                        nobase = nobase or "기준 HEAD 미기록"
+                    elif "기록 커밋 없음" in w:
+                        nobase = nobase or "기준 커밋 확인 불가"
+                    elif "판정 불가" in w:
+                        nobase = nobase or "Git 비교 불가"
+                    else:
+                        warns.append(w)
+            if nobase:
+                line += f"  · {nobase}"
+            if warns:
+                line += "\n  ⚠ " + " · ".join(warns)
+        if m.get("verified"):
+            vh, note = m.get("verified_head"), ""
+            if not vh:
+                note = " (검증 시점 미기록)"
+            elif any("커밋" in w or "분기" in w for w in _repo_warnings(cwd, None, vh)):
+                note = " ⚠ 검증 이후 코드 변경됨"
+            line += f"\n  ✅ 확인: {m['verified']}{note}"
         for j, l in enumerate(mine, 1):
             line += "\n\t" + _numbered(l, f"{n}-{j}")
         (paused if st == "paused" else active).append(line)
@@ -1552,7 +1742,9 @@ def _process(transcript, base=None, db_path=DB_FILE, use_llm=True):
                 # 목차의 묶음 키이고, 진행 로그·결론은 대화 페이지가 받는다.
                 on_topic = bool(topic) and _append_topic(
                     base, topic, date, sid8, prog, summary["resume"],
-                    summary.get("conclusions"), summary.get("dropped"), cwd=meta.get("cwd"))
+                    summary.get("conclusions"), summary.get("dropped"), cwd=meta.get("cwd"),
+
+                    session_id=meta.get("session_id"), verified=summary.get("verified"))
                 # 주제에 붙었으면 진행 로그 정본은 topics/ 다. 대화 페이지에는 머리말로만 얹는다.
                 _write_conversation_page(
                     base, sid8, date, dturns, meta.get("title"),
