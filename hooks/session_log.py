@@ -542,6 +542,8 @@ def build_summary_prompt(meta, current_tasks, choices=()):
   · 주제의 다음 단계도 포함한다 — 순서대로 체크해 나가면 되고, 체크박스여야 완료 이력이 남는다.
     순서가 있으면 제목 앞에 ① ② ③ 를 붙여라.
   · 이미 목록에 있는 것과 같은 일이면 넣지 마라. 새로 생긴 게 없으면 [] 로 두어라.
+- blocker: **막혀서 진행이 안 되는 것**이 있으면 한 줄. 없으면 "".
+  · 남의 승인·VPN·권한·다른 작업 완료처럼 **내가 지금 당장 풀 수 없는 것**만. 할 일은 여기 쓰지 마라.
 - verified: 이번에 **실제로 확인·검증된 것** 한 줄. 테스트를 돌렸는지, 배포했는지, 코드만 짜고 안 돌렸는지.
   · "dry-run 통과, 실제 적용 안 함" 처럼 **어디까지 확실한지**를 적어라. 재개할 때 이것부터 본다.
   · 확인한 게 없으면 "" 로 두어라. 지어내지 마라.
@@ -556,7 +558,7 @@ def build_summary_prompt(meta, current_tasks, choices=()):
         f"{instructions}\n\n"
         "반드시 아래 JSON 하나로만 답하라. 코드펜스/설명 금지:\n"
         '{"topic": "slug 또는 none", "topic_new": null, "progress": "- ...", "resume": "...",\n'
-        '  "verified": "...",\n'
+        '  "verified": "...", "blocker": "",\n'
         '  "conclusions": [], "dropped": [], "tasks_add": []}\n\n'
         f"# 주제 목록\n{slug_list}\n\n"
         f"# 프로젝트\n{title}\n\n"
@@ -583,7 +585,7 @@ def _extract_json(text):
 def _valid_summary(parsed):
     if not isinstance(parsed, dict):
         return None
-    for k in ("topic", "progress", "resume", "verified"):
+    for k in ("topic", "progress", "resume", "verified", "blocker"):
         v = parsed.get(k)
         if v is not None and not isinstance(v, str):
             return None
@@ -599,6 +601,7 @@ def _valid_summary(parsed):
         "progress": parsed.get("progress"),
         "resume": parsed.get("resume"),
         "verified": parsed.get("verified"),
+        "blocker": parsed.get("blocker"),
         "tasks_add": _norm_adds(parsed.get("tasks_add")),
     }
 
@@ -695,7 +698,7 @@ def summarize(meta, current_tasks, use_llm=True, choices=(), known=()):
     title = meta.get("title") or "세션"
     if not use_llm:
         return {"topic": None, "topic_title": "", "conclusions": [], "dropped": [],
-                "progress": f"- [{title}] (dry-run)", "resume": "(dry-run)", "verified": "",
+                "progress": f"- [{title}] (dry-run)", "resume": "(dry-run)", "verified": "", "blocker": "",
                 "tasks_add": [], "_usage": None, "_parts": {}}
     base_prompt, parts = build_summary_prompt(meta, current_tasks, choices)
     nudge = "\n\n[중요] 직전 응답이 형식에 안 맞았다. JSON 객체 하나만 출력하라."
@@ -738,6 +741,7 @@ def summarize(meta, current_tasks, use_llm=True, choices=(), known=()):
         "progress": valid["progress"] or "- (내용 없음)",
         "resume": valid["resume"] or "(다음 미기재)",
         "verified": (valid.get("verified") or "").strip(),
+        "blocker": (valid.get("blocker") or "").strip(),
         "tasks_add": valid["tasks_add"],
         "_usage": usage,
         "_parts": parts,
@@ -1205,7 +1209,7 @@ def _append_section(txt, header, items):
 def _topic_meta(path):
     """frontmatter(status/title/plan) + '🔜 다음' 첫 줄."""
     meta = {"status": "active", "title": "", "next": "", "plan": "", "updated": "", "created": "",
-            "cwd": "", "branch": "", "head": "", "session": "", "verified": "", "verified_head": "", "workspaces": "", "repos": ""}
+            "cwd": "", "branch": "", "head": "", "session": "", "verified": "", "verified_head": "", "workspaces": "", "repos": "", "blocker": ""}
     try:
         txt = open(path, encoding="utf-8").read()
     except OSError:
@@ -1216,7 +1220,7 @@ def _topic_meta(path):
             k, _, v = ln.partition(":")
             k, v = k.strip(), v.strip().strip('"')
             if k in ("status", "title", "plan", "updated", "created",
-                     "cwd", "branch", "head", "session", "verified", "verified_head", "workspaces", "repos"):
+                     "cwd", "branch", "head", "session", "verified", "verified_head", "workspaces", "repos", "blocker"):
                 meta[k] = v
     i = txt.find(NEXT_HEADER)
     if i != -1:
@@ -1276,7 +1280,8 @@ def _fm_set(txt, key, value):
 
 
 def _append_topic(base, slug, date, sid8, progress, next_step,
-                  conclusions=(), dropped=(), cwd=None, session_id=None, verified=None):
+                  conclusions=(), dropped=(), cwd=None, session_id=None, verified=None,
+                  blocker=None):
     """주제 파일의 📈 진행 로그에 prepend + frontmatter 갱신.
     파일이 없으면 만들지 않는다 — 신규 주제 생성은 사용자 지시로만(결정 E)."""
     path = os.path.join(base, TOPICS_DIRNAME, f"{slug}.md")
@@ -1338,6 +1343,11 @@ def _append_topic(base, slug, date, sid8, progress, next_step,
             txt = _fm_set(txt, "head", head)
     if session_id:
         txt = _fm_set(txt, "session", session_id)      # 마지막 세션 full id — resume 대상
+    # blocker 는 풀리면 사라져야 하므로 매번 덮어쓴다(없으면 지운다)
+    if blocker:
+        txt = _fm_set(txt, "blocker", _yaml_val(blocker))
+    else:
+        txt = re.sub(r"^blocker:.*\n", "", txt, count=1, flags=re.M)
     if verified:
         txt = _fm_set(txt, "verified", _yaml_val(verified))
         # 검증은 특정 코드 상태에 대한 것이다. dirty 면 그 HEAD 가 검증 대상을 대표하지 못한다.
@@ -1539,10 +1549,7 @@ def _write_index(base, open_lines=None, done_lines=None):
         t = _task_topic(l)
         if t:
             done_by_topic[t] = done_by_topic.get(t, 0) + 1
-    out = ["# 🧭 INDEX", "",
-           "> 주제·할 일 목차. **체크박스만 직접 건드리세요** — 나머지는 세션 종료 시 다시 씁니다.",
-           "> 주제를 체크하면 그 주제가 닫히고(`status: done`) 목록에서 빠집니다.", "",
-           "## 🔧 진행 중인 주제", ""]
+    summary_bits, dirty_repos, newest = [], [], None
     active, paused, n = [], [], 0
     for n, (slug, m, st) in enumerate(_topic_order(base), 1):
         mine = by_topic.pop(slug, [])
@@ -1606,6 +1613,8 @@ def _write_index(base, open_lines=None, done_lines=None):
         if stale_next:
             line += ("\n  ⚠ 태스크를 모두 끝냈는데 '다음'이 갱신되지 않았습니다 — "
                      "주제를 닫거나(주제 줄 체크) 다음 할 일을 정하세요")
+        if m.get("blocker"):
+            line += f"\n  🚧 막힘: {m['blocker']}"
         if m.get("verified"):
             vh, note = m.get("verified_head"), ""
             if not vh:
@@ -1615,6 +1624,13 @@ def _write_index(base, open_lines=None, done_lines=None):
             line += f"\n  ✅ 확인: {m['verified']}{note}"
         for j, l in enumerate(mine, 1):
             line += "\n\t" + _numbered(l, f"{n}-{j}")
+        if st != "paused":
+            if newest is None:
+                newest = (m.get("title") or slug, _ago(m.get("updated") or m.get("created")))
+            for wpath, _wh in _workspaces(m):
+                nm = os.path.basename(wpath)
+                if nm not in dirty_repos and any("미커밋" in w for w in _repo_warnings(wpath)):
+                    dirty_repos.append(nm)
         (paused if st == "paused" else active).append(line)
     # 남은 슬러그 = 주제 파일이 없거나 완료된 것. 낱개로 흘려보내지 않고 **묶음으로** 렌더한다.
     # 묶음 줄에는 체크박스를 두지 않는다 — 파일이 없어 '묶음 완료' 상태를 저장할 곳이 없고,
@@ -1632,6 +1648,19 @@ def _write_index(base, open_lines=None, done_lines=None):
             g += "\n\t" + _numbered(l, f"{n}-{j}")
         groups.append(g)
 
+    summary_bits.append(f"진행 중 {len(active)}개")
+    if newest:
+        summary_bits.append(f"가장 최근 **{newest[0]}**({newest[1]})")
+    if dirty_repos:
+        summary_bits.append("하다 만 흔적: " + "·".join(dirty_repos[:4]))
+
+    out = ["# 🧭 INDEX", "",
+           "> 주제·할 일 목차. **체크박스만 직접 건드리세요** — 나머지는 세션 종료 시 다시 씁니다.",
+           "> 주제를 체크하면 그 주제가 닫히고(`status: done`) 목록에서 빠집니다.",
+           "> 번호(`5-2`)는 그 시점 렌더의 순번이라 **체크할 때마다 밀립니다** — 남는 문서에 쓰지 마세요.", "",
+           # 고를 재료는 주되 기계가 고르지는 않는다. 우선순위를 잘못 정하면 정보가 없느니만 못하다.
+           "> " + " · ".join(summary_bits), "",
+           "## 🔧 진행 중인 주제", ""]
     out += active or ["_(없음)_"]
     if groups or orphan:
         out += ["", "## ☑️ 기타 태스크", ""] + groups + [_numbered(l, None) for l in orphan]
@@ -1765,7 +1794,8 @@ def _process(transcript, base=None, db_path=DB_FILE, use_llm=True):
                     base, topic, date, sid8, prog, summary["resume"],
                     summary.get("conclusions"), summary.get("dropped"), cwd=meta.get("cwd"),
 
-                    session_id=meta.get("session_id"), verified=summary.get("verified"))
+                    session_id=meta.get("session_id"), verified=summary.get("verified"),
+                      blocker=summary.get("blocker"))
                 # 주제에 붙었으면 진행 로그 정본은 topics/ 다. 대화 페이지에는 머리말로만 얹는다.
                 _write_conversation_page(
                     base, sid8, date, dturns, meta.get("title"),
