@@ -1531,6 +1531,13 @@ def _write_index(base, open_lines=None, done_lines=None):
         done_lines = dn if done_lines is None else done_lines
 
     by_topic, orphan = _open_tasks_by_topic(base, open_lines)
+    # 🔜 다음 은 그 주제로 세션이 돌 때만 갱신된다. 태스크만 체크하고 작업을 안 하면
+    # 이미 끝낸 일을 계속 '다음'으로 가리킨다 — 미완료 0 + 완료 있음이 그 신호다.
+    done_by_topic = {}
+    for l in (done_lines or []):
+        t = _task_topic(l)
+        if t:
+            done_by_topic[t] = done_by_topic.get(t, 0) + 1
     out = ["# 🧭 INDEX", "",
            "> 주제·할 일 목차. **체크박스만 직접 건드리세요** — 나머지는 세션 종료 시 다시 씁니다.",
            "> 주제를 체크하면 그 주제가 닫히고(`status: done`) 목록에서 빠집니다.", "",
@@ -1547,6 +1554,7 @@ def _write_index(base, open_lines=None, done_lines=None):
         if bits:
             line += " · " + " · ".join(bits)
         line += f" · 남은 일 {len(mine)}" if mine else ""
+        stale_next = not mine and done_by_topic.get(slug) and m.get("next")
         if not mine and m.get("next"):
             line += f" — {m['next']}"
         # 재개 한 줄. 원본이 30일 지나 지워졌으면 문서 재개로 안내한다.
@@ -1590,6 +1598,9 @@ def _write_index(base, open_lines=None, done_lines=None):
                 line += f"  · {nobase}"
             if warns:
                 line += "\n  ⚠ " + " · ".join(warns)
+        if stale_next:
+            line += ("\n  ⚠ 태스크를 모두 끝냈는데 '다음'이 갱신되지 않았습니다 — "
+                     "주제를 닫거나(주제 줄 체크) 다음 할 일을 정하세요")
         if m.get("verified"):
             vh, note = m.get("verified_head"), ""
             if not vh:
