@@ -51,7 +51,7 @@ CLAUDE_TIMEOUT_SEC = 300
 
 MIN_USER_CHARS = 12
 MIN_TOTAL_CHARS = 60
-EXCLUDE_MARKERS = ("#nolog", "#기록제외", "#skiplog")   # 세션 증분 전체 제외
+EXCLUDE_MARKERS = ("#nolog", "#기록제외", "#skiplog")   # **세션 전체** 제외 (증분이 아니다)
 # 태스크만 만들지 않는다. 기록(진행 로그·대화·주제 매칭)은 그대로 간다.
 # EXCLUDE_MARKERS 와 역할이 다르다 — 이쪽은 '한 일은 남기되 할 일은 안 만든다'.
 TASK_SKIP_MARKERS = ("#완료", "#done")
@@ -63,7 +63,12 @@ SUMMARY_MAX_TRIES = 2
 # '#로그' 단독 줄 → 그 줄부터 메시지 끝까지 제외(줄 수·크기 무관).
 # EXCLUDE_MARKERS(세션 전체 제외)와 역할이 다르다: 이쪽은 메시지 단위.
 LOG_MARKER_RE = re.compile(r"^[ \t]*#로그[ \t]*$", re.M)
-LOG_FENCED_RE = re.compile(r"^[ \t]*#로그[ \t]*\n```[^\n]*\n.*?\n```[ \t]*$", re.M | re.S)
+# 마커와 펜스 사이의 **빈 줄을 허용한다.** 붙여넣다 보면 한 줄이 끼는데, 그러면 펜스 형태로
+# 인식되지 않고 '그 뒤 전부 삭제' 로 넘어가 **뒤에 쓴 질문까지 사라진다**(실측).
+# 펜스 자체의 들여쓰기와 3개 이상의 백틱도 받는다.
+LOG_FENCED_RE = re.compile(
+    r"^[ \t]*#로그[ \t]*\n(?:[ \t]*\n)*[ \t]*`{3,}[^\n]*\n.*?\n[ \t]*`{3,}[ \t]*$",
+    re.M | re.S)
 # turn당 상한. 실측 User 발화 99백분위 = 19,392자 → 정상 발화 무영향, 전체의 0.20%만 대상
 PASTE_CAP = 20000
 TOOL_LINE_PREFIXES = ("⌘ ", "→ 도구", "← 도구")
@@ -505,15 +510,43 @@ def is_significant(meta):
     return real_user >= MIN_USER_CHARS and total >= MIN_TOTAL_CHARS
 
 
+# compact 요약과 백그라운드 작업 알림은 **시스템이 주입한 텍스트**다. 마커를 인용하고 있어도
+# 사용자가 친 것이 아니다 — 실측: 마커 오탐 4건이 전부 이 둘이었다.
+COMPACT_PREAMBLE = "This session is being continued from a previous conversation"
+TASK_NOTE_RE = re.compile(r"<task-notification>.*?</task-notification>", re.S)
+
+
+def _marker_text(ln):
+    """마커를 찾을 때만 쓰는 정제본.
+
+    `_text_from_content` 는 **건드리지 않는다** — 거기서 줄을 지우면 도구만 있던 turn 이
+    사라져 turn 수가 줄고, 증분 마커가 리셋되어 전 세션이 재요약된다(진행 로그 중복).
+    """
+    if ln.lstrip().startswith(COMPACT_PREAMBLE):
+        return ""
+    return TASK_NOTE_RE.sub(" ", ln)
+
+
 def _has_marker(meta, markers):
-    """user 발화에서 마커를 찾는다. 도구 라인은 사용자가 친 것이 아니므로 제외."""
+    """user 발화에서 마커를 찾는다. **마커만 있는 줄**일 때만 인정한다.
+
+    부분일치는 마커를 *이야기하는* 문장까지 잡는다 — `'#nolog 는 세션 로깅용 마커로 보이는데'`
+    한 줄이 그 세션의 기록을 통째로 날린다. 실측: 실제 사용 47건이 전부 단독 줄이었고,
+    문장 속 12건은 대부분 마커를 설명하는 대화였다.
+
+    놓치는 쪽(`작업 #완료 했어` 처럼 문장에 섞어 친 경우)의 대가는 **눈에 보이는** 태스크
+    몇 줄이고, 잡는 쪽의 대가는 **소리 없는** 기록 유실이다. 비용이 대칭이 아니다.
+    도구 라인은 사용자가 친 것이 아니므로 제외한다.
+    """
+    pats = [re.compile(rf"^\s*{re.escape(m)}\s*$", re.I | re.M) for m in markers]
     for role, lines, _ in meta["turns"]:
         if role != "user":
             continue
         for ln in lines:
             if ln.startswith(("← 도구", "→ 도구", "⌘ ")):
                 continue
-            if any(m in ln.lower() for m in markers):
+            t = _marker_text(ln)
+            if t and any(p.search(t) for p in pats):
                 return True
     return False
 
@@ -2433,7 +2466,12 @@ def _process(transcript, base=None, db_path=DB_FILE, use_llm=True):
             # 제외·사소 경로도 마커가 전진해야 한다. 실패하면 다음 flush 의 증분이
             # 이 구간을 다시 포함하는데, `#nolog` 는 그 증분 **전체**를 제외하므로
             # 그 사이에 한 정상 작업까지 함께 버려진다.
-            if _is_excluded(new_meta):  # 제외 마커: '이번 증분'만 제외, 마커는 전진
+            # 제외 마커는 **세션 전체**를 본다(new_meta 가 아니라 meta).
+            # 증분만 보면 마커를 친 그 구간만 빠지고 다음 flush 부터 아무 일 없었다는 듯
+            # 다시 기록한다. 사용자는 "이 세션은 기록하지 마"로 이해하고 Claude 도 그렇게
+            # 답하는데, 실측 결과 그렇게 답해 놓고 이어지는 날짜가 전부 기록돼 있었다.
+            # 마커는 계속 전진시킨다 — 재시도 큐가 같은 세션을 붙들고 있을 이유가 없다.
+            if _is_excluded(meta):
                 if not db_set_processed(sid, len(all_turns), db_path):
                     _alert_set("제외 구간의 마커 저장 실패 — 다음 기록이 함께 제외될 수 있습니다",
                                db_path)

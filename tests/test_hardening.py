@@ -398,6 +398,62 @@ def main():
             not os.path.isdir(os.path.join(sv, "conversations")))
         chk("요약기 세션은 pending 에서도 빠진다", sum_tr not in sl._pending_list(db))
 
+        # ㉖-4 마커는 단독 줄일 때만. 인용·시스템 주입 텍스트에 걸리면 세션이 통째로 사라진다
+        def mk(txt):
+            return {"turns": [("user", [txt], None)]}
+        chk("단독 줄이면 인식", sl._is_excluded(mk("#nolog")))
+        chk("앞뒤 공백도 인식", sl._is_excluded(mk("  #nolog  ")))
+        chk("여러 줄 중 한 줄이어도 인식", sl._is_excluded(mk("정리해줘\n#nolog\n고마워")))
+        chk("문장 속 인용은 무시",
+            not sl._is_excluded(mk("#nolog 는 세션 로깅용 마커로 보이는데 처리를 못 찾았습니다")))
+        chk("조사가 붙어도 무시", not sl._is_excluded(mk("앞서 보내신 #nolog는 무슨 뜻이야")))
+        chk("compact 요약 안의 인용은 무시",
+            not sl._is_excluded(mk(sl.COMPACT_PREAMBLE + " that ran out of context.\n"
+                                   "user 가 #nolog 를 치면 기록하지 않는다\n")))
+        chk("작업 알림 안의 인용은 무시",
+            not sl._is_excluded(mk("<task-notification>\n#nolog\n</task-notification>")))
+        chk("#완료 도 같은 규칙", sl._is_task_skipped(mk("#완료"))
+            and not sl._is_task_skipped(mk("결론은 #완료 시점에 생성하지 않는다는 것")))
+
+        # ㉖-5 제외 마커는 세션 전체에 걸린다 — 마커를 친 그 구간만 빠지면 안 된다
+        nolog_tr = os.path.join(tmp, "ffffffff-1111-2222-3333-444444444444.jsonl")
+        turns = [("user", "#nolog"), ("assistant", "기록 없이 진행할게요.")]
+        turns += [("user", "이 작업을 이어서 하자. 설정을 정리하고 배포까지 확인한 뒤 알려줘."),
+                  ("assistant", "설정을 정리하고 배포를 확인했습니다. 이상 없이 끝났습니다.")]
+        with open(nolog_tr, "w", encoding="utf-8") as f:
+            for i, (r, t) in enumerate(turns):
+                f.write(json.dumps({"type": r, "timestamp": f"2026-08-2{i%9}T09:00:00Z",
+                                    "cwd": tmp, "message": {"role": r, "content": t}},
+                                   ensure_ascii=False) + "\n")
+        nv = os.path.join(tmp, "nv"); os.makedirs(os.path.join(nv, "topics"))
+        ndb = os.path.join(tmp, "n.db")
+        sl._process(nolog_tr, base=nv, db_path=ndb)          # 1차: 마커가 증분에 있다
+        first = os.path.isdir(os.path.join(nv, "conversations"))
+        with open(nolog_tr, "a", encoding="utf-8") as f:      # 마커 뒤에 새 작업이 이어진다
+            for r, t in (("user", "이번엔 스키마를 정리하고 테스트를 전부 돌려서 결과를 알려줘."),
+                         ("assistant", "스키마를 정리하고 테스트 18개를 전부 돌렸습니다. 통과.")):
+                f.write(json.dumps({"type": r, "timestamp": "2026-08-29T09:00:00Z", "cwd": tmp,
+                                    "message": {"role": r, "content": t}},
+                                   ensure_ascii=False) + "\n")
+        sl._process(nolog_tr, base=nv, db_path=ndb)          # 2차: 마커는 증분 밖이다
+        chk("#nolog 친 세션은 첫 flush 부터 기록 안 함", not first)
+        chk("#nolog 는 다음 flush 에서도 유지된다",
+            not os.path.isdir(os.path.join(nv, "conversations")))
+
+        # ㉖-6 #로그: 펜스 형태는 블록만, 단독 형태는 그 뒤 전부
+        L = sl._strip_log_blocks
+        chk("#로그 단독 → 그 뒤 전부 삭제", "생략" in L("#로그\nERROR aaa\n뒤 문장"))
+        chk("#로그 앞의 말은 남는다", L("이 로그 봐줘\n#로그\nERROR").startswith("이 로그 봐줘"))
+        chk("펜스 형태 → 블록만", "뒷말" in L("앞말\n#로그\n```\nERROR\n```\n뒷말"))
+        # 빈 줄 한 줄에 뒤 내용까지 날아가던 결함
+        chk("마커와 펜스 사이 빈 줄 허용",
+            "뒷말" in L("앞말\n#로그\n\n```\nERROR\n```\n뒷말"))
+        chk("빈 줄 여러 개도 허용",
+            "뒷말" in L("앞말\n#로그\n\n\n```\nERROR\n```\n뒷말"))
+        chk("펜스 들여쓰기 허용", "뒷말" in L("앞말\n#로그\n  ```\n  ERROR\n  ```\n뒷말"))
+        chk("백틱 4개도 펜스", "뒷말" in L("앞말\n#로그\n````\nERROR\n````\n뒷말"))
+        chk("같은 줄에 이어 쓰면 무효", L("#로그  v2.1\n둘째") == "#로그  v2.1\n둘째")
+
         # ㉗ DB 를 못 읽어 중단할 때도 목차에 남는다
         av = os.path.join(tmp, "av"); os.makedirs(os.path.join(av, "topics"))
         open(os.path.join(av, "INDEX.md"), "w", encoding="utf-8").write(
