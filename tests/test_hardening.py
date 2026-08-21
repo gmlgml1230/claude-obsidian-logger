@@ -453,6 +453,16 @@ def main():
         chk("펜스 들여쓰기 허용", "뒷말" in L("앞말\n#로그\n  ```\n  ERROR\n  ```\n뒷말"))
         chk("백틱 4개도 펜스", "뒷말" in L("앞말\n#로그\n````\nERROR\n````\n뒷말"))
         chk("같은 줄에 이어 쓰면 무효", L("#로그  v2.1\n둘째") == "#로그  v2.1\n둘째")
+        # 여러 번 쓸 수 있어야 한다 — 로그 덩어리마다 마커를 붙이는 것이 정상 사용이다
+        two = L("에러 둘 봐줘\n#로그\n```\nA\n```\n그리고 이것도\n#로그\n```\nB\n```\n원인은?")
+        chk("펜스형을 두 번 쓰면 둘 다 빠진다", two.count("블록 생략") == 2)
+        chk("사이의 설명과 마지막 질문은 남는다",
+            "그리고 이것도" in two and "원인은?" in two and "A" not in two and "B" not in two)
+        chk("연속 세 번도 전부", L("#로그\n```\nA\n```\n#로그\n```\nB\n```\n"
+                                "#로그\n```\nC\n```\n끝").count("블록 생략") == 3)
+        mixed = L("앞말\n#로그\n```\nA\n```\n중간\n#로그\nB 원문\n이 뒤는?")
+        chk("펜스형 뒤에 단독형을 섞으면 순서대로 처리",
+            mixed.count("블록 생략") == 1 and "이후" in mixed and "중간" in mixed)
 
         # ㉗ DB 를 못 읽어 중단할 때도 목차에 남는다
         av = os.path.join(tmp, "av"); os.makedirs(os.path.join(av, "topics"))
