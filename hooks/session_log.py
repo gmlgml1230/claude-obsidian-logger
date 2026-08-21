@@ -1877,7 +1877,9 @@ def _repo_warnings(path, branch=None, head=None, label=None, cache=None):
                         out.append(f"{tag}그 뒤 {n}커밋")
     st = git("status", "--porcelain")
     if st and st.returncode == 0 and st.stdout.strip():
-        out.append(f"{tag}미커밋 변경 있음")
+        # 파일 수까지 준다. '있음' 만으로는 손댈 만한 일인지 판단이 안 돼서
+        # 결국 저장소에 가서 다시 봐야 한다 — 목차가 답을 못 주는 셈이다.
+        out.append(f"{tag}미커밋 변경 {len(st.stdout.strip().splitlines())}개 파일")
     if cache is not None:
         cache[ck] = out
     return out
