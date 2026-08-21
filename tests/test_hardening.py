@@ -347,6 +347,37 @@ def main():
         sl._alert_clear(test)
         chk("다른 DB 의 해제가 운영 경고를 지우지 않는다", sl._alert_get(prod) == "운영 경고")
 
+        # ㉖-2 verified 판정: '미커밋' 을 '커밋' 으로 읽지 않고, cwd 가 저장소가 아니어도
+        #      그 sha 를 아는 저장소에서 잰다
+        vr = os.path.join(tmp, "vrepo"); os.makedirs(vr)
+        subprocess.run(["git", "-C", vr, "init", "-q"], check=True)
+        for k, v in (("user.email", "t@t"), ("user.name", "t")):
+            subprocess.run(["git", "-C", vr, "config", k, v], check=True)
+        open(os.path.join(vr, "a"), "w").write("a")
+        subprocess.run(["git", "-C", vr, "add", "-A"], capture_output=True)
+        subprocess.run(["git", "-C", vr, "commit", "-qm", "i"], capture_output=True)
+        vhead = subprocess.run(["git", "-C", vr, "rev-parse", "--short", "HEAD"],
+                               capture_output=True, text=True).stdout.strip()
+        notrepo = os.path.join(tmp, "plain"); os.makedirs(notrepo)
+        vv = os.path.join(tmp, "vv"); os.makedirs(os.path.join(vv, "topics"))
+        open(os.path.join(vv, "topics", "t.md"), "w", encoding="utf-8").write(
+            f'---\ntitle: T\nstatus: active\nupdated: 2026-08-21\ncwd: {notrepo}\n'
+            f'repos: [{os.path.basename(vr)}]\nsession: x\n'
+            f'verified: "테스트 통과"\nverified_head: {vhead}\n---\n\n## 🔜 다음\n')
+        sl._write_index(vv)
+        line = open(os.path.join(vv, "INDEX.md"), encoding="utf-8").read()
+        chk("cwd 가 비저장소여도 '변경됨' 으로 단정하지 않는다", "검증 이후 코드 변경됨" not in line)
+        chk("clean 이면 경고가 안 붙는다", "✅ 확인: 테스트 통과\n" in line + "\n")
+        open(os.path.join(vr, "a"), "w").write("b")      # 미커밋 변경만 만든다
+        sl._write_index(vv)
+        line = open(os.path.join(vv, "INDEX.md"), encoding="utf-8").read()
+        chk("미커밋은 미커밋으로 보고한다", "검증 이후 미커밋 변경 있음" in line)
+        chk("미커밋을 '코드 변경됨' 으로 승격하지 않는다", "검증 이후 코드 변경됨" not in line)
+        subprocess.run(["git", "-C", vr, "commit", "-aqm", "next"], capture_output=True)
+        sl._write_index(vv)
+        chk("실제 커밋이 쌓이면 그때 '코드 변경됨'",
+            "검증 이후 코드 변경됨" in open(os.path.join(vv, "INDEX.md"), encoding="utf-8").read())
+
         # ㉗ DB 를 못 읽어 중단할 때도 목차에 남는다
         av = os.path.join(tmp, "av"); os.makedirs(os.path.join(av, "topics"))
         open(os.path.join(av, "INDEX.md"), "w", encoding="utf-8").write(

@@ -1747,7 +1747,7 @@ def _append_topic(base, slug, date, sid8, progress, next_step,
         txt = _fm_set(txt, "verified", _yaml_val(verified))
         # 검증은 특정 코드 상태에 대한 것이다. dirty 면 그 HEAD 가 검증 대상을 대표하지 못한다.
         _, vh = _git_state(cwd) if cwd else (None, None)
-        dirty = any("미커밋" in w for w in _repo_warnings(cwd)) if cwd else True
+        dirty = any(W_DIRTY in w for w in _repo_warnings(cwd)) if cwd else True
         if vh and not dirty:
             txt = _fm_set(txt, "verified_head", vh)
         else:
@@ -1938,6 +1938,17 @@ def _ago(datestr):
     if n < 14: return f"{n}일 전"
     if n < 60: return f"{n // 7}주 전"
     return f"{n // 30}개월 전"
+
+
+# 경고 문자열을 부분일치로 판정하면 **`미커밋` 안에 `커밋` 이 들어 있어** 오판한다(실측:
+# 미커밋 변경만 있는데 '검증 이후 코드 변경됨' 이 떴다). 판정에 쓰는 조각은 여기 모아 둔다.
+W_AHEAD, W_DIVERGED, W_DIRTY = "그 뒤 ", "분기됨", "미커밋"
+W_UNKNOWN = ("판정 불가", "경로 없음")
+
+
+def _drifted(warns):
+    """기록 시점 이후 **커밋 수준의 변경**이 있었나. 미커밋 변경은 별도로 본다."""
+    return any(W_AHEAD in w or W_DIVERGED in w for w in warns)
 
 
 def _repo_warnings(path, branch=None, head=None, label=None, cache=None):
@@ -2222,11 +2233,23 @@ def _write_index(base, open_lines=None, done_lines=None, db_path=DB_FILE, alerts
             line += f"\n  🚧 막힘: {m['blocker']}"
         if m.get("verified"):
             vh, note = m.get("verified_head"), ""
+            # 검증 sha 가 어느 저장소 것인지는 적혀 있지 않다. **그 sha 를 아는 저장소**에서
+            # 재야 한다 — cwd 만 보면, cwd 가 저장소가 아닐 때 "기록 커밋 없음 — 판정 불가"가
+            # 나오고 그 안의 '커밋' 이라는 글자에 걸려 **판정 불가가 '변경됨' 으로 둔갑한다**(실측).
+            drift = None
+            for wp, _wh in (ws or []) + [(cwd, None)]:
+                ws_warn = _repo_warnings(wp, None, vh, cache=wcache) if vh else []
+                if any(u in w for w in ws_warn for u in W_UNKNOWN):
+                    continue                      # 이 저장소는 그 sha 를 모른다
+                drift = _drifted(ws_warn)
+                break
             if not vh:
                 note = " (검증 시점 미기록)"
-            elif any("커밋" in w or "분기" in w for w in _repo_warnings(cwd, None, vh, cache=wcache)):
+            elif drift is None:
+                note = " (검증 시점 대조 불가)"
+            elif drift:
                 note = " ⚠ 검증 이후 코드 변경됨"
-            elif any("미커밋" in w for wp, _wh in (ws or [(cwd, None)])
+            elif any(W_DIRTY in w for wp, _wh in (ws or [(cwd, None)])
                      for w in _repo_warnings(wp, cache=wcache)):
                 # 커밋만 보면 같은 HEAD 에서 작업트리만 고친 경우를 놓치고,
                 # cwd 만 보면 한 주제가 걸친 **보조 저장소**의 변경을 놓친다.
@@ -2239,7 +2262,8 @@ def _write_index(base, open_lines=None, done_lines=None, db_path=DB_FILE, alerts
                 newest = (m.get("title") or slug, _ago(m.get("updated") or m.get("created")))
             for wpath, _wh in ws:
                 nm = os.path.basename(wpath)
-                if nm not in dirty_repos and any("미커밋" in w for w in _repo_warnings(wpath, cache=wcache)):
+                if nm not in dirty_repos and any(W_DIRTY in w
+                                                 for w in _repo_warnings(wpath, cache=wcache)):
                     dirty_repos.append(nm)
         (paused if st == "paused" else active).append(line)
     # 남은 슬러그 = 주제 파일이 없거나 완료된 것. 낱개로 흘려보내지 않고 **묶음으로** 렌더한다.
