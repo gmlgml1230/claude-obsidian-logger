@@ -1136,11 +1136,24 @@ def _backup_tasks(path, content):
             pass
 
 
+RENDER_STAMP_PREFIX = "> 이 목차는 "
+
+
+def _strip_stamp(md):
+    return "\n".join(l for l in (md or "").splitlines()
+                      if not l.startswith(RENDER_STAMP_PREFIX))
+
+
 def _safe_write_index(path, new_md):
     cur = ""
     if os.path.exists(path):
         with open(path, encoding="utf-8") as f:
             cur = f.read()
+    # 시각 한 줄만 달라진 렌더는 쓰지 않는다 — 안 그러면 아무것도 안 바뀐 FileChanged 마다
+    # 파일이 변경되고 git 스냅샷에 의미 없는 커밋이 쌓인다. 그래서 이 시각은
+    # '마지막 렌더' 가 아니라 **'마지막으로 내용이 바뀐 때'** 다(문구도 그렇게 적었다).
+    if cur and _strip_stamp(cur) == _strip_stamp(new_md):
+        return True
     cur_n, new_n = _count_tasks(cur), _count_tasks(new_md)
     if cur_n >= 1 and new_n == 0:
         _debug(f"[worker] INDEX 덮어쓰기 거부(와이프 방지): {cur_n}→0")
@@ -1382,7 +1395,8 @@ def _topic_slugs(base):
                   for p in glob.glob(os.path.join(d, "*.md")))
 
 
-FENCE_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})([^\n]*)$", re.M)
+# 들여쓰기는 **공백 3칸까지**만 펜스다. 줄머리 탭은 4칸으로 펼쳐지므로 펜스가 아니다.
+FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})([^\n]*)$", re.M)
 
 
 def _fence_spans(txt):
@@ -1398,8 +1412,7 @@ def _fence_spans(txt):
         if tok[0] == "`" and "`" in rest:
             continue                      # ```x``` 처럼 한 줄에서 닫히는 인라인 코드
         if open_at is None:
-            if rest.strip() and tok[0] == "~" and "~" in rest:
-                continue
+            # 물결표 펜스의 info string 에는 `~` 도 백틱도 들어갈 수 있다(`~~~python~3`).
             open_at, marker = m.start(), tok
         elif tok[0] == marker[0] and len(tok) >= len(marker) and not rest.strip():
             spans.append((open_at, m.end()))
@@ -1989,7 +2002,10 @@ def _repo_root(path):
             root = None
     if root is None:
         root = walk(os.path.realpath(ap))
-    _REPO_ROOT_CACHE[path] = root
+    # **음성 결과는 캐시하지 않는다.** 오래 도는 --catchup 도중에 저장소가 생기거나
+    # symlink 가 바뀌면 그 뒤로 계속 틀린 답을 준다.
+    if root:
+        _REPO_ROOT_CACHE[path] = root
     return root
 
 
@@ -2050,7 +2066,7 @@ def _open_tasks_by_topic(base, open_lines=None):
     return by_topic, orphan
 
 
-def _write_index(base, open_lines=None, done_lines=None, db_path=DB_FILE):
+def _write_index(base, open_lines=None, done_lines=None, db_path=DB_FILE, alerts=()):
     """INDEX.md 재생성. **태스크의 정본이자 목차**다.
 
     사람은 체크박스만 건드리고 나머지는 자동 생성이다. open/done 을 주지 않으면
@@ -2139,8 +2155,12 @@ def _write_index(base, open_lines=None, done_lines=None, db_path=DB_FILE):
                          f"{' ' + extra if extra else ''} {shlex.quote(boot)}`  (원본 만료)")
             # 저장소 상태 경고 — workspace 마다 따로 잰다
             warns, nobase = [], ""
+            # cwd 가 저장소 하위 디렉터리면 ws 에는 **루트**가 담긴다. 문자열로 비교하면
+            # 기록 브랜치가 영영 안 넘어가 브랜치 변경만 조용히 빠진다(실측).
+            cwd_root = os.path.realpath(_repo_root(cwd) or cwd)
             for wpath, whead in ws:
-                for w in _repo_warnings(wpath, m.get("branch") if wpath == cwd else None,
+                for w in _repo_warnings(wpath,
+                                        m.get("branch") if os.path.realpath(wpath) == cwd_root else None,
                                         whead, os.path.basename(wpath) if len(ws) > 1 else None,
                                         cache=wcache):
                     if "기록 HEAD 없음" in w:
@@ -2200,6 +2220,10 @@ def _write_index(base, open_lines=None, done_lines=None, db_path=DB_FILE):
             g += "\n\t" + _numbered(l, f"{n}-{j}")
         groups.append(g)
 
+    # DB 가 통째로 죽으면 pending 도 못 쓴다 — 그때는 이번 실행이 **메모리로** 들고 온
+    # 사실만이 유일한 근거다. 목차에 못 실으면 그 실패는 어디에도 안 남는다.
+    for a in alerts or ():
+        summary_bits.append(f"⚠ {a}")
     rows = _pending_rows(db_path)
     if rows:
         # 조용히 빠지면 '없었던 일' 이 된다. 세는 것은 0토큰이므로 목차에 드러낸다.
@@ -2222,7 +2246,7 @@ def _write_index(base, open_lines=None, done_lines=None, db_path=DB_FILE):
            "> 번호(`5-2`)는 그 시점 렌더의 순번이라 **체크할 때마다 밀립니다** — 남는 문서에 쓰지 마세요.",
            # '3일 전' 도 git 경고도 **렌더 시점의 스냅샷**이다. 파일을 여는 것만으로는
            # 갱신되지 않으므로, 무엇을 기준으로 한 말인지 밝혀야 오독이 안 생긴다.
-           f"> 이 목차는 **{datetime.now():%Y-%m-%d %H:%M}** 기준입니다 — "
+           f"{RENDER_STAMP_PREFIX}**{datetime.now():%Y-%m-%d %H:%M}** 에 갱신됐습니다 — "
            "경과·git 상태는 그때의 값입니다.", "",
            # 고를 재료는 주되 기계가 고르지는 않는다. 우선순위를 잘못 정하면 정보가 없느니만 못하다.
            "> " + " · ".join(summary_bits), "",
@@ -2419,18 +2443,20 @@ def _process(transcript, base=None, db_path=DB_FILE, use_llm=True):
             weeks[(now.isocalendar()[0], now.isocalendar()[1])] = now
             for dd in weeks.values():
                 _write_weekly_digest(base, dd)
-            if not db_set_processed(sid, processed_upto, db_path):
-                # 마커를 못 남겼으면 다음 실행이 같은 구간을 다시 처리한다. DONE 이라고 쓰면
-                # 나중에 로그만 보고 '정상 처리됨' 으로 오독한다.
+            marked = db_set_processed(sid, processed_upto, db_path)
+            if not marked:
+                # 마커를 못 남겼으면 다음 실행이 같은 구간을 다시 처리한다.
                 _pending_add(transcript, db_path)
-                # pending 을 추가한 뒤이므로 **다시 렌더해야** 경고가 실린다.
+                # **경고를 인자로 넘긴다.** pending 도 같은 DB 라 함께 죽었을 수 있어서,
+                # 렌더가 DB 만 보면 이 실패는 아무 데도 안 남는다.
                 try:
-                    _write_index(base, db_path=db_path)
+                    _write_index(base, db_path=db_path,
+                                 alerts=["증분 마커 저장 실패 — 다음 실행이 같은 구간을 다시 기록합니다"])
                 except Exception as e2:
                     _debug("[worker] 실패 표시 렌더 실패: " + repr(e2))
-                _debug("[worker] 경고: 증분 마커 저장 실패 — 다음 실행이 이 구간을 다시 처리한다")
             _git_snapshot(base)
-            _debug(f"[worker] DONE: +{processed_upto - processed}turn, {done_groups}/{len(groups)}일")
+            _debug(f"[worker] {'DONE' if marked else 'DONE(마커 미저장)'}: "
+                   f"+{processed_upto - processed}turn, {done_groups}/{len(groups)}일")
     except Exception as e:
         # 요약은 됐는데 파일 쓰기에서 터진 경우가 여기로 온다. pending 에 넣지 않으면
         # 마커는 그대로여도 **다시 실행될 계기가 없다.**
@@ -2550,8 +2576,10 @@ def main():
         for path, _tries in rows:
             print(f"재시도: {path}")
             _process(path)
-        print(f"완료 — 남은 pending {len(_pending_rows())}건")
-        return
+        left = len(_pending_rows())
+        print(f"완료 — 남은 pending {left}건")
+        # 남은 게 있으면 실패다. 종료 코드 0 이면 자동화에서 성공과 구분할 수 없다.
+        return 1 if left else 0
     if "--catchup" in sys.argv:   # 수동 회수: 열린 세션 + 밀린 pending
         seen = set()
         _catchup(seen)
@@ -2609,4 +2637,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main() or 0)

@@ -279,6 +279,44 @@ def main():
             want = doc.rindex(H) if doc.count(H) > 1 else doc.index(H)
             chk(f"펜스 판정: {name}",
                 sl._find_header(doc, H) == want and sl._section_items(doc, H) == ["진짜"])
+        # 물결표 펜스의 info string 에는 ~ 가 들어갈 수 있고, 줄머리 탭은 펜스가 아니다
+        d1 = '---\nt: 1\n---\n\n~~~python~3\n## 🔜 다음\n~~~\n\n## 🔜 다음\n\n- 진짜\n'
+        chk("펜스 판정: ~~~python~3",
+            sl._find_header(d1, H) == d1.rindex(H) and sl._section_items(d1, H) == ["진짜"])
+        d2 = '---\nt: 1\n---\n\n\t```\n## 🔜 다음\n\n- 진짜\n'
+        chk("펜스 판정: 줄머리 탭은 펜스가 아니다",
+            sl._find_header(d2, H) != -1 and sl._section_items(d2, H) == ["진짜"])
+
+        # ㉒ 하위 디렉터리 cwd 에서도 브랜치 드리프트가 보인다
+        rr = os.path.join(tmp, "brepo"); os.makedirs(os.path.join(rr, "pkg"))
+        subprocess.run(["git", "-C", rr, "init", "-q", "-b", "oldbranch"], check=True)
+        for k, v in (("user.email", "t@t"), ("user.name", "t")):
+            subprocess.run(["git", "-C", rr, "config", k, v], check=True)
+        open(os.path.join(rr, "a"), "w").write("a")
+        subprocess.run(["git", "-C", rr, "add", "-A"], capture_output=True)
+        subprocess.run(["git", "-C", rr, "commit", "-qm", "i"], capture_output=True)
+        subprocess.run(["git", "-C", rr, "checkout", "-q", "-b", "newbranch"], check=True)
+        bv = os.path.join(tmp, "bv"); os.makedirs(os.path.join(bv, "topics"))
+        open(os.path.join(bv, "topics", "t.md"), "w", encoding="utf-8").write(
+            f'---\ntitle: T\nstatus: active\nupdated: 2026-08-10\n'
+            f'cwd: {os.path.join(rr, "pkg")}\nbranch: oldbranch\nsession: x\n---\n\n## 🔜 다음\n')
+        sl._write_index(bv)
+        chk("하위 디렉터리에서도 브랜치 변경이 보인다",
+            "oldbranch→newbranch" in open(os.path.join(bv, "INDEX.md"), encoding="utf-8").read())
+
+        # ㉓ 없는 저장소는 캐시하지 않는다
+        nd = os.path.join(tmp, "notrepo"); os.makedirs(nd)
+        chk("비저장소는 None", sl._repo_root(nd) is None)
+        subprocess.run(["git", "-C", nd, "init", "-q"], check=True)
+        chk("뒤늦게 만들어진 저장소도 인식", sl._repo_root(nd) is not None)
+
+        # ㉔ 시각만 달라진 렌더는 파일을 건드리지 않는다
+        p_idx = os.path.join(bv, "INDEX.md")
+        before = open(p_idx, encoding="utf-8").read()
+        mt = os.path.getmtime(p_idx)
+        sl._write_index(bv)
+        chk("시각만 다른 재렌더는 무변경", open(p_idx, encoding="utf-8").read() == before)
+        chk("파일을 다시 쓰지도 않는다", os.path.getmtime(p_idx) == mt)
 
         # ⑲ _unstamp 는 줄 끝만 — 사람이 본문에 쓴 날짜를 지우지 않는다
         chk("본문 중간의 ✅ 날짜 보존",
