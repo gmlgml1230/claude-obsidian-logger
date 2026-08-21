@@ -1382,15 +1382,28 @@ def _topic_slugs(base):
                   for p in glob.glob(os.path.join(d, "*.md")))
 
 
+FENCE_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})([^\n]*)$", re.M)
+
+
 def _fence_spans(txt):
-    """``` 로 감싼 구간들. 이 안의 `## …` 는 문서 예시이지 섹션이 아니다."""
-    spans, start = [], None
-    for m in re.finditer(r"^[ \t]*```", txt, re.M):
-        if start is None:
-            start = m.start()
-        else:
-            spans.append((start, m.end()))
-            start = None
+    """코드펜스 구간들. 이 안의 `## …` 는 문서 예시이지 섹션이 아니다.
+
+    여는 펜스의 **문자와 길이**를 기억한다. ```` 로 연 블록은 그 안의 ``` 로 닫히지 않는다 —
+    개수만 세면 4-backtick 예시 블록에서 경계가 어긋나 진짜 헤더를 지운다(실측).
+    `~~~` 도 펜스이고, 줄 안에서 닫히는 인라인 코드(```x```)는 펜스가 아니다.
+    """
+    spans, open_at, marker = [], None, None
+    for m in FENCE_RE.finditer(txt):
+        tok, rest = m.group(1), m.group(2)
+        if tok[0] == "`" and "`" in rest:
+            continue                      # ```x``` 처럼 한 줄에서 닫히는 인라인 코드
+        if open_at is None:
+            if rest.strip() and tok[0] == "~" and "~" in rest:
+                continue
+            open_at, marker = m.start(), tok
+        elif tok[0] == marker[0] and len(tok) >= len(marker) and not rest.strip():
+            spans.append((open_at, m.end()))
+            open_at = None
     # **닫히지 않은 펜스는 버린다.** EOF 까지 마스킹하면 그 뒤의 진짜 헤더가 전부 숨는데,
     # 대화 문서는 붙여넣기 때문에 펜스가 실제로 자주 어긋난다(실측: vault 133건 중 3건).
     # 코드블록 안의 헤더를 한 번 잘못 읽는 쪽이, 뒤쪽 섹션을 통째로 잃는 쪽보다 낫다.
@@ -1931,6 +1944,9 @@ def _repo_warnings(path, branch=None, head=None, label=None, cache=None):
     return out
 
 
+_REPO_ROOT_CACHE = {}
+
+
 def _repo_root(path):
     """`.git` 이 나올 때까지 올라간다.
 
@@ -1942,15 +1958,31 @@ def _repo_root(path):
     # (실측: vault 안에서 렌더하면 vault 자신이 작업 저장소로 들어왔다).
     if not path or not os.path.isdir(path):
         return None
-    p = os.path.abspath(path)
-    while p and p != "/":
-        if os.path.exists(os.path.join(p, ".git")):
-            return p
-        nxt = os.path.dirname(p)
-        if nxt == p:
-            break
-        p = nxt
-    return None
+    if path in _REPO_ROOT_CACHE:
+        return _REPO_ROOT_CACHE[path]
+    root = None
+    try:
+        # `.git` 을 직접 찾아 올라가면 **symlink 에서 틀린다** — 저장소 밖을 가리키는
+        # 링크는 못 찾고, 상위 저장소 안에 있는 링크는 엉뚱하게 상위를 집는다(실측).
+        # git 이 같은 경로에 대해 정답을 알고 있으므로 그쪽에 묻는다.
+        r = subprocess.run(["git", "-C", path, "rev-parse", "--show-toplevel"],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0 and r.stdout.strip():
+            root = r.stdout.strip()
+    except Exception:
+        root = None
+    if root is None:                       # git 이 없거나 실패하면 옛 방식으로 폴백
+        p = os.path.abspath(path)
+        while p and p != "/":
+            if os.path.exists(os.path.join(p, ".git")):
+                root = p
+                break
+            nxt = os.path.dirname(p)
+            if nxt == p:
+                break
+            p = nxt
+    _REPO_ROOT_CACHE[path] = root
+    return root
 
 
 def _workspaces(m):
@@ -2084,7 +2116,11 @@ def _write_index(base, open_lines=None, done_lines=None, db_path=DB_FILE):
                 docs += f" 와 {m['plan']}"
             boot = (f"{docs} 를 읽고, 기록 시점과 지금 git 상태의 차이를 먼저 보고한 뒤 "
                     f"남은 일부터 이어서 하자")
-            extra = " ".join(f"--add-dir {shlex.quote(w)}" for w, _ in ws if w != cwd)
+            # git 은 realpath 를 돌려주고 cwd 는 기록된 그대로다. 문자열로 비교하면
+            # symlink 를 지나는 경로에서 같은 저장소가 --add-dir 로 한 번 더 붙는다.
+            rc = os.path.realpath(cwd)
+            extra = " ".join(f"--add-dir {shlex.quote(w)}"
+                             for w, _ in ws if os.path.realpath(w) != rc)
             if _resumable(sess):
                 # 여러 저장소에 걸친 주제는 재개해도 나머지 저장소에 접근 권한이 없다.
                 # `--add-dir` 는 `--resume` 과 함께 쓸 수 있다(claude --help 확인).
@@ -2160,9 +2196,11 @@ def _write_index(base, open_lines=None, done_lines=None, db_path=DB_FILE):
     if rows:
         # 조용히 빠지면 '없었던 일' 이 된다. 세는 것은 0토큰이므로 목차에 드러낸다.
         stuck = sum(1 for _, n in rows if n >= PENDING_MAX_TRIES)
+        # 명령은 **그대로 복사해 실행되는 형태**로 준다. `session_log.py` 는 PATH 에 없다.
+        cmd = f"python3 {shlex.quote(os.path.abspath(__file__))} --retry-pending"
         bit = f"⚠ 기록 실패 {len(rows)}세션"
-        bit += (f" — {stuck}건은 자동 재시도 중단, `session_log.py --retry-pending`"
-                if stuck else " — 다음 세션에서 재시도")
+        bit += (f" — {stuck}건은 자동 재시도 중단" if stuck else " — 다음 세션에서 재시도")
+        bit += f" · 지금 회수: `{cmd}`"
         summary_bits.append(bit)
     summary_bits.append(f"진행 중 {len(active)}개")
     if newest:
@@ -2173,7 +2211,11 @@ def _write_index(base, open_lines=None, done_lines=None, db_path=DB_FILE):
     out = ["# 🧭 INDEX", "",
            "> 주제·할 일 목차. **체크박스만 직접 건드리세요** — 나머지는 세션 종료 시 다시 씁니다.",
            "> 주제를 체크하면 그 주제가 닫히고(`status: done`) 목록에서 빠집니다.",
-           "> 번호(`5-2`)는 그 시점 렌더의 순번이라 **체크할 때마다 밀립니다** — 남는 문서에 쓰지 마세요.", "",
+           "> 번호(`5-2`)는 그 시점 렌더의 순번이라 **체크할 때마다 밀립니다** — 남는 문서에 쓰지 마세요.",
+           # '3일 전' 도 git 경고도 **렌더 시점의 스냅샷**이다. 파일을 여는 것만으로는
+           # 갱신되지 않으므로, 무엇을 기준으로 한 말인지 밝혀야 오독이 안 생긴다.
+           f"> 이 목차는 **{datetime.now():%Y-%m-%d %H:%M}** 기준입니다 — "
+           "경과·git 상태는 그때의 값입니다.", "",
            # 고를 재료는 주되 기계가 고르지는 않는다. 우선순위를 잘못 정하면 정보가 없느니만 못하다.
            "> " + " · ".join(summary_bits), "",
            "## 🔧 진행 중인 주제", ""]
@@ -2373,6 +2415,11 @@ def _process(transcript, base=None, db_path=DB_FILE, use_llm=True):
                 # 마커를 못 남겼으면 다음 실행이 같은 구간을 다시 처리한다. DONE 이라고 쓰면
                 # 나중에 로그만 보고 '정상 처리됨' 으로 오독한다.
                 _pending_add(transcript, db_path)
+                # pending 을 추가한 뒤이므로 **다시 렌더해야** 경고가 실린다.
+                try:
+                    _write_index(base, db_path=db_path)
+                except Exception as e2:
+                    _debug("[worker] 실패 표시 렌더 실패: " + repr(e2))
                 _debug("[worker] 경고: 증분 마커 저장 실패 — 다음 실행이 이 구간을 다시 처리한다")
             _git_snapshot(base)
             _debug(f"[worker] DONE: +{processed_upto - processed}turn, {done_groups}/{len(groups)}일")
@@ -2381,6 +2428,11 @@ def _process(transcript, base=None, db_path=DB_FILE, use_llm=True):
         # 마커는 그대로여도 **다시 실행될 계기가 없다.**
         try:
             _pending_add(transcript, db_path)
+            # 락은 이미 풀린 뒤다(with 블록을 빠져나오며 해제). 잡히면 경고를 실어 준다 —
+            # 쓰기 도중 터진 실패가 목차에 안 뜨면 요약 실패와 똑같이 조용한 누락이 된다.
+            with _vault_lock(blocking=False) as got:
+                if got:
+                    _write_index(base, db_path=db_path)
         except Exception:
             pass
         import traceback
@@ -2435,7 +2487,7 @@ def _is_summarizer_session(meta):
     return False
 
 
-def _catchup():
+def _catchup(done=None):
     """열려 있는(=최근 수정된) 세션들을 SessionEnd 와 똑같이 기록한다. 세션 자체는 건드리지 않는다.
 
     **자동 실행은 없다.** 자정 launchd 잡은 제거했다 — `~/Documents` 가 macOS 보호 폴더라
@@ -2460,6 +2512,8 @@ def _catchup():
     _debug(f"[catchup] 대상 {len(todo)}개 (최근 {CATCHUP_DAYS}일, 요약기 세션 {skipped}개 제외)")
     for f in sorted(todo, key=os.path.getmtime):
         _process(f)
+        if done is not None:
+            done.add(f)
     _trim_launchd_logs()
     _debug("[catchup] 완료")
 
@@ -2491,8 +2545,13 @@ def main():
         print(f"완료 — 남은 pending {len(_pending_rows())}건")
         return
     if "--catchup" in sys.argv:   # 수동 회수: 열린 세션 + 밀린 pending
-        _catchup()
+        seen = set()
+        _catchup(seen)
         for path, _t in _pending_rows():
+            if path in seen:
+                # 방금 catchup 에서 실패해 pending 에 들어온 것이다. 같은 실행에서 또 돌리면
+                # LLM 비용을 두 번 쓰고 tries 만 두 번 오른다.
+                continue
             _debug(f"[catchup] pending 재시도: {path}")
             _process(path)
         return

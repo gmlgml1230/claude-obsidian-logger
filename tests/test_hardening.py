@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """버그 하드닝 회귀 테스트. 각 항목은 실제로 재현된 결함에 대응한다."""
+import atexit
 import importlib.util, json, os, re, subprocess, tempfile, shutil
 
 # 실제 ~/.claude/hooks 를 건드리지 않는다 — 그러면 진짜 워커 락과 경합하고
 # 실제 pending DB 를 읽어 테스트가 비결정적이 된다. import 시점에 읽히므로 그 전에 건다.
-os.environ["SESSIONLOG_STATE_DIR"] = tempfile.mkdtemp(prefix="sessionlog-test-")
+_STATE = tempfile.mkdtemp(prefix="sessionlog-test-")
+os.environ["SESSIONLOG_STATE_DIR"] = _STATE
+atexit.register(shutil.rmtree, _STATE, True)   # 실행마다 남지 않게
 
 HOOK = os.path.join(os.path.dirname(__file__), "..", "hooks", "session_log.py")
 spec = importlib.util.spec_from_file_location("sl", HOOK)
@@ -266,6 +269,16 @@ def main():
             sl._section_items(unclosed, "## 📌 결론") == ["진짜 결론"])
         chk("그래서 실제 섹션을 만든다",
             sl._ensure_sections(fenced).rstrip().endswith("## 🔜 다음"))
+        # 펜스는 여는 문자·길이로 닫힌다. 개수만 세면 4-backtick 예시에서 경계가 어긋난다.
+        H = "## 🔜 다음"
+        for name, doc in (
+            ("4-backtick", '---\nt: 1\n---\n\n````md\n```\n## 🔜 다음\n```\n````\n\n## 🔜 다음\n\n- 진짜\n'),
+            ("~~~ 펜스", '---\nt: 1\n---\n\n~~~md\n## 🔜 다음\n~~~\n\n## 🔜 다음\n\n- 진짜\n'),
+            ("줄머리 인라인 코드", '---\nt: 1\n---\n\n```x```\n## 🔜 다음\n\n- 진짜\n```y```\n'),
+        ):
+            want = doc.rindex(H) if doc.count(H) > 1 else doc.index(H)
+            chk(f"펜스 판정: {name}",
+                sl._find_header(doc, H) == want and sl._section_items(doc, H) == ["진짜"])
 
         # ⑲ _unstamp 는 줄 끝만 — 사람이 본문에 쓴 날짜를 지우지 않는다
         chk("본문 중간의 ✅ 날짜 보존",
@@ -274,8 +287,14 @@ def main():
         # ⑳ 저장소 하위 디렉터리에서 작업해도 드리프트가 보인다
         rp = os.path.join(tmp, "repo"); os.makedirs(os.path.join(rp, "pkg"))
         subprocess.run(["git", "-C", rp, "init", "-q"], check=True)
+        got_ws = sl._workspaces({"cwd": os.path.join(rp, "pkg")})
         chk("하위 디렉터리 → 저장소 루트로 인식",
-            sl._workspaces({"cwd": os.path.join(rp, "pkg")}) == [(rp, None)])
+            [(os.path.realpath(w), h) for w, h in got_ws] == [(os.path.realpath(rp), None)])
+        # symlink 로 저장소 밖에서 가리켜도 실제 저장소를 찾아야 한다
+        link = os.path.join(tmp, "link-to-pkg")
+        os.symlink(os.path.join(rp, "pkg"), link)
+        chk("symlink 경로도 실제 저장소로",
+            os.path.realpath(sl._repo_root(link) or "") == os.path.realpath(rp))
         # 없는 경로/상대 경로가 프로세스 cwd 를 타고 엉뚱한 상위 저장소를 잡으면 안 된다
         chk("없는 경로는 저장소가 아니다", sl._repo_root(os.path.join(rp, "없는폴더")) is None)
         chk("상대 경로는 저장소가 아니다", sl._repo_root("data-airflow") is None)
