@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """버그 하드닝 회귀 테스트. 각 항목은 실제로 재현된 결함에 대응한다."""
-import importlib.util, os, re, tempfile, shutil
+import importlib.util, json, os, re, subprocess, tempfile, shutil
 
 HOOK = os.path.join(os.path.dirname(__file__), "..", "hooks", "session_log.py")
 spec = importlib.util.spec_from_file_location("sl", HOOK)
@@ -103,6 +103,58 @@ def main():
         cur = open(idx, encoding="utf-8").read()
         chk("사람이 지운 항목은 되살리지 않음", "작업 A" not in cur)
         chk("나머지는 그대로", "작업 B" in cur and "사람이 손으로 넣은 C" in cur)
+        # 아무도 안 건드린 정상 경로에서는 순서가 그대로여야 한다
+        rows = [f"- [ ] 작업 {i}" for i in range(1, 6)]
+        open(idx, "w", encoding="utf-8").write(
+            "# 🧭 INDEX\n\n## ☑️ 기타 태스크\n\n" + "\n".join(rows) + "\n")
+        sl._update_tasks(base, list(rows), [], db, {sl._task_key(r) for r in rows})
+        got = [l.strip() for l in open(idx, encoding="utf-8")
+               if l.lstrip().startswith("- [ ]") and not sl.HEADER_LINE_RE.match(l)]
+        chk("정상 경로에서 순서 보존", got == rows)
+
+        # ⑨ 실패한 세션이 pending 에 남고, 성공하면 빠진다
+        tr = os.path.join(tmp, "aaaaaaaa-1111-2222-3333-444444444444.jsonl")
+        with open(tr, "w", encoding="utf-8") as f:
+            for r, t in (("user", "데모 주제 작업을 이어서 하자. 스키마를 정리하고 "
+                                   "테스트를 전부 돌려서 결과를 알려줘."),
+                         ("assistant", "스키마를 정리하고 테스트를 돌렸습니다. 18개 전부 통과했습니다.")):
+                f.write(json.dumps({"type": r, "timestamp": "2026-08-21T10:00:00Z", "cwd": tmp,
+                                    "message": {"role": r, "content": t}},
+                                   ensure_ascii=False) + "\n")
+        real = sl.summarize
+        sl.summarize = lambda *a, **k: None                     # LLM 실패
+        sl._process(tr, base=base, db_path=db)
+        chk("요약 실패 → pending 등록", tr in sl._pending_list(db))
+        chk("요약 실패 → 마커 전진 안 함",
+            sl.db_get_processed("aaaaaaaa-1111-2222-3333-444444444444", db) == 0)
+        sl.summarize = lambda *a, **k: {
+            "topic": None, "topic_title": "", "progress": "- 했다", "resume": "다음",
+            "verified": "", "blocker": "", "conclusions": [], "dropped": [],
+            "tasks_add": [], "_usage": None, "_parts": {}}
+        sl._process(tr, base=base, db_path=db)
+        chk("성공하면 pending 해제", sl._pending_list(db) == [])
+        for _ in range(sl.PENDING_MAX_TRIES + 1):
+            sl._pending_add("/x/y.jsonl", db)
+        chk("재시도 상한 초과분은 목록에서 빠짐", "/x/y.jsonl" not in sl._pending_list(db))
+        sl.summarize = real
+
+        # ⑩ git 스냅샷은 훅 경로만, 삭제도 반영
+        g = os.path.join(tmp, "g"); os.makedirs(os.path.join(g, "topics"))
+        subprocess.run(["git", "-C", g, "init", "-q"], check=True)
+        for k, v in (("user.email", "t@t"), ("user.name", "t")):
+            subprocess.run(["git", "-C", g, "config", k, v], check=True)
+        open(os.path.join(g, "topics", "a.md"), "w").write("a")
+        open(os.path.join(g, "내노트.md"), "w").write("사람이 편집 중")
+        subprocess.run(["git", "-C", g, "add", "topics"], capture_output=True)
+        subprocess.run(["git", "-C", g, "commit", "-qm", "init"], capture_output=True)
+        os.remove(os.path.join(g, "topics", "a.md"))
+        open(os.path.join(g, "topics", "b.md"), "w").write("b")
+        sl._git_snapshot(g)
+        show = subprocess.run(["git", "-C", g, "show", "--name-status", "HEAD"],
+                              capture_output=True, text=True).stdout
+        chk("스냅샷: 삭제 반영", "topics/a.md" in show and "D\t" in show)
+        chk("스냅샷: 신규 반영", "topics/b.md" in show)
+        chk("스냅샷: 사람 노트 제외", "내노트" not in show)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("\n" + ("=== 전부 통과 ===" if not FAIL else f"=== 실패 {len(FAIL)}건: {FAIL} ==="))
