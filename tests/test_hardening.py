@@ -178,6 +178,11 @@ def main():
         chk("앞 단계가 뒤 단계의 부분문자열이어도 남는다",
             len(sl._apply_task_adds(["- [ ] 운영 데이터 백필"],
                                     [{"text": "운영 데이터 백필 결과 검증"}], None, None)) == 2)
+        # 접두어가 긴 형제 쌍(0.923). 임계값이 여기까지 내려오면 태스크가 소리 없이 사라진다.
+        chk("접두어가 긴 형제 태스크도 둘 다 남는다",
+            len(sl._apply_task_adds(["- [ ] dim_voucher 증분 적재 누락 백필"],
+                                    [{"text": "dim_voucher_use 증분 적재 누락 백필"}],
+                                    None, None)) == 2)
 
         # ⑫ 결론·접은 안도 한 줄, _one_line 은 선두 기호를 보존
         c1 = sl._valid_summary({"topic": "x", "conclusions": ["정상\n## 침입\n- [x] 가짜"]})
