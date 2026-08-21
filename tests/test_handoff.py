@@ -6,6 +6,10 @@
 """
 import importlib.util, json, os, re, subprocess, sys, tempfile, shutil
 
+# 실제 ~/.claude/hooks 를 건드리지 않는다 — 그러면 진짜 워커 락과 경합하고
+# 실제 pending DB 를 읽어 테스트가 비결정적이 된다. import 시점에 읽히므로 그 전에 건다.
+os.environ["SESSIONLOG_STATE_DIR"] = tempfile.mkdtemp(prefix="sessionlog-test-")
+
 HOOK = os.path.join(os.path.dirname(__file__), "..", "hooks", "session_log.py")
 spec = importlib.util.spec_from_file_location("sl", HOOK)
 sl = importlib.util.module_from_spec(spec); spec.loader.exec_module(sl)

@@ -2,6 +2,10 @@
 """버그 하드닝 회귀 테스트. 각 항목은 실제로 재현된 결함에 대응한다."""
 import importlib.util, json, os, re, subprocess, tempfile, shutil
 
+# 실제 ~/.claude/hooks 를 건드리지 않는다 — 그러면 진짜 워커 락과 경합하고
+# 실제 pending DB 를 읽어 테스트가 비결정적이 된다. import 시점에 읽히므로 그 전에 건다.
+os.environ["SESSIONLOG_STATE_DIR"] = tempfile.mkdtemp(prefix="sessionlog-test-")
+
 HOOK = os.path.join(os.path.dirname(__file__), "..", "hooks", "session_log.py")
 spec = importlib.util.spec_from_file_location("sl", HOOK)
 sl = importlib.util.module_from_spec(spec); spec.loader.exec_module(sl)
@@ -199,11 +203,18 @@ def main():
 
         # ⑭ 같은 구간 재처리가 대화·daily 를 두 번 쌓지 않는다
         turns = [("user", ["안녕하세요 반갑습니다"], None)]
-        for _ in range(2):
-            sl._write_conversation_page(base, "ab12cd34", "2026-08-21", turns, "T", "- 진행")
+        for _ in range(2):   # 같은 **구간**을 두 번 처리 = 마커 저장 실패 후 재시도
+            sl._write_conversation_page(base, "ab12cd34", "2026-08-21", turns, "T", "- 진행",
+                                        rng="0-1")
             sl._append_daily(base, "2026-08-21", "t", "- 진행", "conversations/ab12cd34_2026-08-21")
-        cp = open(os.path.join(base, "conversations", "ab12cd34_2026-08-21.md"), encoding="utf-8").read()
-        chk("대화 본문 1회만", cp.count("안녕하세요 반갑습니다") == 1)
+        cpath = os.path.join(base, "conversations", "ab12cd34_2026-08-21.md")
+        cp = open(cpath, encoding="utf-8").read()
+        chk("같은 구간 재처리: 본문 1회만", cp.count("안녕하세요 반갑습니다") == 1)
+        # 다른 구간에서 같은 말을 또 했다면 그건 정상 대화다 — 부분문자열 판정이면 여기서 유실된다
+        sl._write_conversation_page(base, "ab12cd34", "2026-08-21", turns, "T", "- 또 진행",
+                                    rng="1-2")
+        cp = open(cpath, encoding="utf-8").read()
+        chk("다른 구간의 같은 발화는 보존", cp.count("안녕하세요 반갑습니다") == 2)
         chk("daily 1줄만",
             open(os.path.join(base, "daily", "2026-08-21.md"), encoding="utf-8").read().count("[t]") == 1)
 
@@ -232,6 +243,52 @@ def main():
         with sl._db_tasks(db2) as c:
             n_ev = c.execute("SELECT count(*) FROM task_events").fetchone()[0]
         chk("키 교체 첫 실행: 이벤트 0건", n_ev == 0)
+
+        # ⑱ 헤더 탐색은 frontmatter 값도 코드펜스도 섹션으로 세지 않는다
+        tp2 = os.path.join(base, "topics", "hdr.md")
+        open(tp2, "w", encoding="utf-8").write(
+            '---\ntitle: "## 🔜 다음"\nstatus: active\n---\n\n'
+            "## 📌 결론\n\n## ❌ 접은 안\n\n## 📈 진행 로그\n\n## 🔜 다음\n")
+        sl._append_topic(base, "hdr", "2026-08-21", "abc12345", "- 진행", "실제 다음")
+        t2 = open(tp2, encoding="utf-8").read()
+        fm2 = re.match(r"^---\n(.*?)\n---\n", t2, re.S)
+        chk("frontmatter 가 닫혀 있다", bool(fm2))
+        chk("frontmatter 안에 제목이 그대로", bool(fm2) and 'title: "## 🔜 다음"' in fm2.group(1))
+        chk("frontmatter 안에 본문이 섞이지 않았다", bool(fm2) and "- 실제 다음" not in fm2.group(1))
+        chk("그래도 다음·진행은 기록됨", "- 실제 다음" in t2 and "- 진행" in t2)
+        fenced = '---\ntitle: T\n---\n\n```md\n## 📌 결론\n- 예시\n```\n\n본문\n'
+        chk("코드펜스 안의 헤더는 섹션이 아니다", sl._find_header(fenced, "## 📌 결론") == -1)
+        chk("그래서 실제 섹션을 만든다",
+            sl._ensure_sections(fenced).rstrip().endswith("## 🔜 다음"))
+
+        # ⑲ _unstamp 는 줄 끝만 — 사람이 본문에 쓴 날짜를 지우지 않는다
+        chk("본문 중간의 ✅ 날짜 보존",
+            sl._unstamp("- [ ] 인증서 ✅ 2026-09-01까지 갱신") == "- [ ] 인증서 ✅ 2026-09-01까지 갱신")
+
+        # ⑳ 저장소 하위 디렉터리에서 작업해도 드리프트가 보인다
+        rp = os.path.join(tmp, "repo"); os.makedirs(os.path.join(rp, "pkg"))
+        subprocess.run(["git", "-C", rp, "init", "-q"], check=True)
+        chk("하위 디렉터리 → 저장소 루트로 인식",
+            sl._workspaces({"cwd": os.path.join(rp, "pkg")}) == [(rp, None)])
+        # 없는 경로/상대 경로가 프로세스 cwd 를 타고 엉뚱한 상위 저장소를 잡으면 안 된다
+        chk("없는 경로는 저장소가 아니다", sl._repo_root(os.path.join(rp, "없는폴더")) is None)
+        chk("상대 경로는 저장소가 아니다", sl._repo_root("data-airflow") is None)
+
+        # ㉑ 요약 실패는 그 자리에서 목차에 뜬다
+        fail_tr = os.path.join(tmp, "bbbbbbbb-1111-2222-3333-444444444444.jsonl")
+        with open(fail_tr, "w", encoding="utf-8") as f:
+            for r, t in (("user", "또 다른 주제 작업을 이어서 하자. 설정을 정리하고 "
+                                   "배포까지 확인한 다음 결과를 알려줘."),
+                         ("assistant", "설정을 정리하고 배포를 확인했습니다. 이상 없이 끝났습니다.")):
+                f.write(json.dumps({"type": r, "timestamp": "2026-08-21T11:00:00Z", "cwd": tmp,
+                                    "message": {"role": r, "content": t}},
+                                   ensure_ascii=False) + "\n")
+        real2 = sl.summarize
+        sl.summarize = lambda *a, **k: None
+        sl._process(fail_tr, base=base, db_path=db)
+        sl.summarize = real2
+        chk("실패가 INDEX 에 즉시 표시됨",
+            "기록 실패" in open(os.path.join(base, "INDEX.md"), encoding="utf-8").read())
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("\n" + ("=== 전부 통과 ===" if not FAIL else f"=== 실패 {len(FAIL)}건: {FAIL} ==="))

@@ -188,6 +188,7 @@ def _pending_clear(path, db_path=DB_FILE):
 
 
 PENDING_MAX_TRIES = 5
+PENDING_DRAIN_PER_RUN = 2      # 백로그가 현재 세션 기록을 굶기지 않게
 
 
 def _pending_rows(db_path=DB_FILE):
@@ -893,7 +894,9 @@ def _stamp_done(line, date_str):
 def _unstamp(line):
     """열린 줄의 `✅ 날짜` 제거. 체크를 풀었는데 스탬프가 남으면 weekly 가 그 항목을
     계속 완료로 세고, 사람 눈에도 '완료인데 열려 있는' 모순으로 보인다."""
-    return re.sub(r"\s*✅\s*\d{4}-\d{2}-\d{2}", "", line).rstrip()
+    # **줄 끝**만 본다. 줄 중간까지 지우면 `- [ ] 인증서 ✅ 2026-09-01까지 갱신` 처럼
+    # 사람이 본문에 쓴 날짜가 통째로 사라진다(실측).
+    return re.sub(r"\s*✅\s*\d{4}-\d{2}-\d{2}\s*$", "", line).rstrip()
 
 
 # 앞의 들여쓰기까지 흡수한다 — 렌더가 매번 탭을 새로 붙이므로 여기서 정규화하지 않으면
@@ -1199,7 +1202,7 @@ def _update_tasks(base, open_new, done_cur, db_path=DB_FILE, base_keys=None):
         _archive_done(base, old)
         _debug(f"[worker] 완료 아카이브 이동: {len(old)}건")
     recent.sort(key=lambda x: _done_date(x) or "", reverse=True)   # 최신 완료가 위
-    _write_index(base, open_new, recent)
+    _write_index(base, open_new, recent, db_path)
     _sync_task_states(base, db_path)  # 쓰기 후 snapshot 갱신
 
 
@@ -1316,8 +1319,14 @@ def _conv_head(progress, conclusions=(), dropped=()):
     return "\n".join(out) + "\n" if out else ""
 
 
+def _flush_marker(sid8, date, rng):
+    """이 파일에 이미 실린 **처리 구간**. 본문 부분문자열로 판정하면
+    같은 질문을 다시 한 정상 대화가 '이미 있음' 으로 버려진다(실측)."""
+    return f"<!-- flush {sid8} {date} {rng} -->"
+
+
 def _write_conversation_page(base, sid8, date, turns, title=None, progress=None, topic=None,
-                             conclusions=(), dropped=()):
+                             conclusions=(), dropped=(), rng=None):
     """그날 대화 원문. 세션 허브를 두지 않으므로 진행 요약도 여기 얹는다
     (주제가 잡힌 세션은 topics/ 가 정본이고, 여기 요약은 대화를 여는 사람용 머리말)."""
     d = os.path.join(base, CONV_DIRNAME)
@@ -1325,16 +1334,17 @@ def _write_conversation_page(base, sid8, date, turns, title=None, progress=None,
     path = os.path.join(d, f"{sid8}_{date}.md")
     body = _render_turns(turns)
     head_extra = _conv_head(progress, conclusions, dropped)
+    mark = _flush_marker(sid8, date, rng) + "\n" if rng else ""
     if os.path.exists(path):
         # 같은 날 두 번째 flush. 머리말을 다시 실어 중간에 헤더가 반복되지만,
         # 빼면 두 번째 증분에서 나온 결론이 유실된다 — 중복이 유실보다 낫다.
         cur = open(path, encoding="utf-8").read()
-        if body.strip() and body.strip() in cur:
-            # 마커 저장이 실패해 **같은 구간을 다시 처리**하는 경우다. 대화를 두 번 싣지 않는다.
-            _debug(f"[worker] {sid8}_{date}: 이미 실린 대화 — 재기록 건너뜀")
+        if mark and mark.strip() in cur:
+            # 마커 저장이 실패해 **같은 구간을 다시 처리**하는 경우다. 두 번 싣지 않는다.
+            _debug(f"[worker] {sid8}_{date}: 이미 실린 구간({rng}) — 재기록 건너뜀")
             return
         with open(path, "a", encoding="utf-8") as f:
-            f.write("\n" + head_extra + body)
+            f.write("\n" + mark + head_extra + body)
         return
     # title frontmatter: Front Matter Title 플러그인이 파일명 대신 표시
     disp = f"{title or topic or '대화'} · {date}"
@@ -1343,6 +1353,7 @@ def _write_conversation_page(base, sid8, date, turns, title=None, progress=None,
         f.write(head)
         if topic:
             f.write(f"> 주제: [[{TOPICS_DIRNAME}/{topic}]]\n\n")
+        f.write(mark)
         f.write(head_extra)
         f.write(f"# 💬 {date} 대화\n\n" + body)
 
@@ -1371,13 +1382,46 @@ def _topic_slugs(base):
                   for p in glob.glob(os.path.join(d, "*.md")))
 
 
-def _find_header(txt, header, start=0):
-    """본문에서 **줄 전체가** 그 헤더인 위치. frontmatter 의 `title: "## 📌 결론"` 이나
-    코드블록 안의 같은 문자열을 섹션으로 오인하지 않는다(실측: 결론이 엉뚱한 데 붙었다)."""
+def _fence_spans(txt):
+    """``` 로 감싼 구간들. 이 안의 `## …` 는 문서 예시이지 섹션이 아니다."""
+    spans, start = [], None
+    for m in re.finditer(r"^[ \t]*```", txt, re.M):
+        if start is None:
+            start = m.start()
+        else:
+            spans.append((start, m.end()))
+            start = None
+    if start is not None:
+        spans.append((start, len(txt)))
+    return spans
+
+
+def _body_start(txt):
     m = re.match(r"^---\n.*?\n---\n", txt, re.S)
-    off = max(start, m.end() if m else 0)
-    mm = re.compile(rf"^{re.escape(header)}[ \t]*$", re.M).search(txt, off)
-    return mm.start() if mm else -1
+    return m.end() if m else 0
+
+
+def _find_header(txt, header, start=0):
+    """본문에서 **줄 전체가** 그 헤더인 위치. frontmatter 의 `title: "## 📌 결론"` 도,
+    코드펜스 안의 예시도 섹션으로 세지 않는다 — 둘 다 실제 파일에서 오독을 만들었다."""
+    off = max(start, _body_start(txt))
+    fences = _fence_spans(txt)
+    for mm in re.compile(rf"^{re.escape(header)}[ \t]*$", re.M).finditer(txt, off):
+        if not any(a <= mm.start() < b for a, b in fences):
+            return mm.start()
+    return -1
+
+
+def _next_section(txt, pos, pattern=r"^#{2,3} "):
+    """pos 이후 다음 섹션 머리의 **앞 개행 위치**(없으면 -1). `txt.find("\n## ")` 대체다 —
+    코드펜스 안의 헤더에서 끊기지 않게 한다."""
+    fences = _fence_spans(txt)
+    for mm in re.compile(pattern, re.M).finditer(txt, pos):
+        i = mm.start()
+        if any(a <= i < b for a, b in fences):
+            continue
+        return i - 1 if i and txt[i - 1] == "\n" else i
+    return -1
 
 
 def _section_items(txt, header):
@@ -1448,7 +1492,7 @@ def _append_section(txt, header, items):
     i = _find_header(txt, header)
     if i == -1:
         return txt
-    j = txt.find("\n## ", i + 1)
+    j = _next_section(txt, i + 1, r"^## ")
     body = (txt[i:j] if j != -1 else txt[i:]).replace("- _(없음)_", "").rstrip()
     body += "\n" + "\n".join(f"- {x}" for x in items) + "\n"
     return txt[:i] + body + (f"\n{txt[j + 1:]}" if j != -1 else "")
@@ -1470,7 +1514,7 @@ def _topic_meta(path):
             if k in ("status", "title", "plan", "updated", "created",
                      "cwd", "branch", "head", "session", "verified", "verified_head", "workspaces", "repos", "blocker"):
                 meta[k] = v
-    i = txt.find(NEXT_HEADER)
+    i = _find_header(txt, NEXT_HEADER)
     if i != -1:
         for ln in txt[i + len(NEXT_HEADER):].splitlines():
             s = ln.strip().lstrip("-").strip()
@@ -1590,7 +1634,8 @@ def _append_topic(base, slug, date, sid8, progress, next_step,
         # 블록의 끝은 **다음 ### 이거나 다음 ## 이거나 문서 끝** 중 가장 앞이다.
         # ### 만 보면 그 뒤에 오는 '## 🔜 다음' 을 넘어 문서 끝에 붙고,
         # 아래 '다음' 교체가 그 구간을 통째로 지운다 — 로그는 '이어붙임' 성공으로 남는다(실측).
-        ends = [x for x in (txt.find("\n### ", i0 + 1), txt.find("\n## ", i0 + 1)) if x != -1]
+        ends = [x for x in (_next_section(txt, i0 + 1, r"^### "),
+                            _next_section(txt, i0 + 1, r"^## ")) if x != -1]
         blk_end = min(ends) if ends else len(txt.rstrip())
         # 진행 로그는 **완전 일치**만 중복으로 본다. 유사도(0.75)를 쓰면
         # "오전 작업"/"오후 작업" 처럼 짧고 다른 줄이 오탐으로 사라진다 — 유실보다 중복이 낫다.
@@ -1607,7 +1652,7 @@ def _append_topic(base, slug, date, sid8, progress, next_step,
             _debug(f"[worker] topics/{slug}: {date}/{sid8} 새 진행 없음")
     else:
         block = f"{marker}|💬 대화]]\n{progress.rstrip()}"
-        i = txt.find(PROGRESS_HEADER)
+        i = _find_header(txt, PROGRESS_HEADER)
         if i == -1:
             txt = txt.rstrip() + f"\n\n{PROGRESS_HEADER}\n\n{block}\n"
         else:
@@ -1651,11 +1696,11 @@ def _append_topic(base, slug, date, sid8, progress, next_step,
     if next_step:
         # '다음'의 정본은 '## 🔜 다음' 섹션 하나다 (_topic_meta 가 여기서 읽는다).
         # frontmatter 에 next 를 중복 기록하지 않는다.
-        j = txt.find(NEXT_HEADER)
+        j = _find_header(txt, NEXT_HEADER)
         if j != -1:
-            # '🔜 다음' 이 마지막 섹션이면 find 가 -1 을 준다.
+            # '🔜 다음' 이 마지막 섹션이면 -1 이 온다.
             # txt[-1:] 로 흘러가면 마지막 문자가 뒤에 붙으므로 명시적으로 분기한다.
-            k = txt.find("\n##", j + 1)
+            k = _next_section(txt, j + 1, r"^#{2,}")
             tail = txt[k:].lstrip("\n") if k != -1 else ""
             body = f"{NEXT_HEADER}\n\n- {next_step.strip()}\n"
             txt = txt[:j] + body + (f"\n{tail}" if tail else "")
@@ -1885,6 +1930,28 @@ def _repo_warnings(path, branch=None, head=None, label=None, cache=None):
     return out
 
 
+def _repo_root(path):
+    """`.git` 이 나올 때까지 올라간다.
+
+    하위 디렉터리를 cwd 로 기록한 세션은 저장소로 인식되지 않아 **드리프트가 통째로 숨는다**
+    (실측: `repo/pkg` 에서 작업하면 INDEX 에 경고가 하나도 안 뜬다).
+    worktree 는 `.git` 이 파일이므로 isdir 가 아니라 exists 로 본다."""
+    # **실제로 존재하는 디렉터리만** 출발점으로 받는다. 없는 경로나 상대 경로를 넣으면
+    # `abspath` 가 프로세스 cwd 기준으로 풀려 **전혀 상관없는 상위 저장소**를 잡는다
+    # (실측: vault 안에서 렌더하면 vault 자신이 작업 저장소로 들어왔다).
+    if not path or not os.path.isdir(path):
+        return None
+    p = os.path.abspath(path)
+    while p and p != "/":
+        if os.path.exists(os.path.join(p, ".git")):
+            return p
+        nxt = os.path.dirname(p)
+        if nxt == p:
+            break
+        p = nxt
+    return None
+
+
 def _workspaces(m):
     """주제가 걸친 저장소들 → [(path, head)].
 
@@ -1896,10 +1963,10 @@ def _workspaces(m):
     out, seen = [], set()
 
     def add(path, sha=None):
-        path = (path or "").rstrip("/")
-        if path and path not in seen and os.path.isdir(os.path.join(path, ".git")):
-            seen.add(path)
-            out.append((path, sha or None))
+        root = _repo_root((path or "").rstrip("/"))
+        if root and root not in seen:
+            seen.add(root)
+            out.append((root, sha or None))
 
     add(cwd, m.get("head"))                      # cwd 가 저장소면 그것이 기준
     for src in (m.get("workspaces"), m.get("repos")):
@@ -1942,7 +2009,7 @@ def _open_tasks_by_topic(base, open_lines=None):
     return by_topic, orphan
 
 
-def _write_index(base, open_lines=None, done_lines=None):
+def _write_index(base, open_lines=None, done_lines=None, db_path=DB_FILE):
     """INDEX.md 재생성. **태스크의 정본이자 목차**다.
 
     사람은 체크박스만 건드리고 나머지는 자동 생성이다. open/done 을 주지 않으면
@@ -2088,12 +2155,13 @@ def _write_index(base, open_lines=None, done_lines=None):
             g += "\n\t" + _numbered(l, f"{n}-{j}")
         groups.append(g)
 
-    rows = _pending_rows()
+    rows = _pending_rows(db_path)
     if rows:
         # 조용히 빠지면 '없었던 일' 이 된다. 세는 것은 0토큰이므로 목차에 드러낸다.
         stuck = sum(1 for _, n in rows if n >= PENDING_MAX_TRIES)
         bit = f"⚠ 기록 실패 {len(rows)}세션"
-        bit += f"({stuck}건 자동 재시도 중단 — 수동 조치 필요)" if stuck else " — 다음 세션에서 재시도"
+        bit += (f" — {stuck}건은 자동 재시도 중단, `session_log.py --retry-pending`"
+                if stuck else " — 다음 세션에서 재시도")
         summary_bits.append(bit)
     summary_bits.append(f"진행 중 {len(active)}개")
     if newest:
@@ -2256,7 +2324,8 @@ def _process(transcript, base=None, db_path=DB_FILE, use_llm=True):
                     base, sid8, date, dturns, meta.get("title"),
                     None if on_topic else prog, topic if on_topic else None,
                     conclusions=() if on_topic else summary.get("conclusions"),
-                    dropped=() if on_topic else summary.get("dropped"))
+                    dropped=() if on_topic else summary.get("dropped"),
+                    rng=f"{processed_upto}-{processed_upto + len(dturns)}")
                 last_conv = f"{CONV_DIRNAME}/{sid8}_{date}"
                 # daily 라벨은 묶음 키까지 쓴다 — cwd 폴백은 한 주제가 여러 repo 에 걸치면 어긋난다.
                 _append_daily(base, date, topic or project,
@@ -2275,6 +2344,12 @@ def _process(transcript, base=None, db_path=DB_FILE, use_llm=True):
                 _debug(f"[worker] {date}: topic={topic or 'none'} 진행 로그·대화·데일리 기록")
 
             if done_groups == 0:
+                # 여기서 그냥 나가면 pending 에 넣어 놓고도 **목차에는 아무 표시가 없다.**
+                # 다음에 Claude 를 쓸 때까지 누락 사실을 알 방법이 없어진다.
+                try:
+                    _write_index(base, db_path=db_path)
+                except Exception as e:
+                    _debug("[worker] 실패 표시 렌더 실패: " + repr(e))
                 _debug("[worker] ABORT: 한 그룹도 처리 못 함 — 마커 유지")
                 return
             if done_groups == len(groups):
@@ -2404,16 +2479,32 @@ def main():
         return _run_dry(use_llm=True)
     if "--dry-run" in sys.argv:
         return _run_dry(use_llm=False)
-    if "--catchup" in sys.argv:   # launchd 자정 실행: 열린 세션도 기록
-        return _catchup()
+    if "--retry-pending" in sys.argv:
+        # 상한(PENDING_MAX_TRIES)을 넘겨 자동 재시도가 멈춘 것까지 **전부** 다시 돌린다.
+        # 경고에 이 명령을 적어 두었으므로 여기가 사용자의 복구 경로다.
+        rows = _pending_rows()
+        _debug(f"[retry-pending] 대상 {len(rows)}건")
+        for path, _tries in rows:
+            print(f"재시도: {path}")
+            _process(path)
+        print(f"완료 — 남은 pending {len(_pending_rows())}건")
+        return
+    if "--catchup" in sys.argv:   # 수동 회수: 열린 세션 + 밀린 pending
+        _catchup()
+        for path, _t in _pending_rows():
+            _debug(f"[catchup] pending 재시도: {path}")
+            _process(path)
+        return
     if "--worker" in sys.argv:
         tr = sys.argv[sys.argv.index("--worker") + 1]
-        # 지난 실패분을 먼저 회수한다. 자동 catchup 이 없으므로(TCC) **여기가 유일한 재시도 지점**이다.
-        for old in _pending_list():
+        # **현재 세션이 먼저다.** 재시도를 앞에 두면 백로그가 쌓였을 때
+        # 방금 끝난 세션의 기록이 몇 시간씩 밀린다(실측: 21건이면 22번째로 처리된다).
+        _process(tr)
+        for old in _pending_list()[:PENDING_DRAIN_PER_RUN]:
             if old != tr and os.path.exists(old):
                 _debug(f"[worker] pending 재시도: {old}")
                 _process(old)
-        return _process(tr)
+        return
     if "--filechanged" in sys.argv:  # INDEX 외부 편집 감지 → 완료 전이 기록 + 즉시 재렌더
         try:
             sys.stdin.read()
