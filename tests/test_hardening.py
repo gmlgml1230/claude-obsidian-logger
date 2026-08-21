@@ -341,6 +341,44 @@ def main():
         chk("경고가 뜬다", first)
         chk("체크박스 한 번에 지워지지 않는다", again)
         chk("해제하면 사라진다", gone)
+        # 경고 파일은 **그 DB 옆에** 있다 — 별도 DB 를 쓰는 dry-run 이 운영 경고를 지우면 안 된다
+        prod, test = os.path.join(tmp, "prod.db"), os.path.join(tmp, "test.db")
+        sl._alert_set("운영 경고", prod)
+        sl._alert_clear(test)
+        chk("다른 DB 의 해제가 운영 경고를 지우지 않는다", sl._alert_get(prod) == "운영 경고")
+
+        # ㉗ DB 를 못 읽어 중단할 때도 목차에 남는다
+        av = os.path.join(tmp, "av"); os.makedirs(os.path.join(av, "topics"))
+        open(os.path.join(av, "INDEX.md"), "w", encoding="utf-8").write(
+            "# 🧭 INDEX\n\n## ☑️ 기타 태스크\n\n- [ ] 뭔가\n")
+        baddb = os.path.join(tmp, "bad.db"); os.makedirs(baddb)
+        alert_tr = os.path.join(tmp, "dddddddd-1111-2222-3333-444444444444.jsonl")
+        with open(alert_tr, "w", encoding="utf-8") as f:
+            for r, t in (("user", "이 작업을 이어서 하자. 설정을 정리하고 배포까지 "
+                                  "확인한 다음 결과를 알려줘."),
+                         ("assistant", "설정을 정리하고 배포를 확인했습니다. 이상 없이 끝났습니다.")):
+                f.write(json.dumps({"type": r, "timestamp": "2026-08-21T12:00:00Z", "cwd": tmp,
+                                    "message": {"role": r, "content": t}},
+                                   ensure_ascii=False) + "\n")
+        sl._process(alert_tr, base=av, db_path=baddb)
+        chk("읽기 실패가 목차에 남는다",
+            "기록하지 못했습니다" in open(os.path.join(av, "INDEX.md"), encoding="utf-8").read())
+
+        # ㉘ 쓰기가 되살아나면 **그 렌더에서** 경고가 걷힌다
+        good = os.path.join(tmp, "good.db")
+        sl._alert_set("증분 마커 저장 실패 — 테스트", good)
+        sl._write_index(av, db_path=good)
+        was = "증분 마커 저장 실패" in open(os.path.join(av, "INDEX.md"), encoding="utf-8").read()
+        real3 = sl.summarize
+        sl.summarize = lambda *a, **k: {
+            "topic": None, "topic_title": "", "progress": "- 했다", "resume": "다음",
+            "verified": "", "blocker": "", "conclusions": [], "dropped": [],
+            "tasks_add": [], "_usage": None, "_parts": {}}
+        sl._process(alert_tr, base=av, db_path=good)
+        sl.summarize = real3
+        chk("복구 전 경고가 있었다", was)
+        chk("복구 직후 같은 렌더에서 걷힌다",
+            "증분 마커 저장 실패" not in open(os.path.join(av, "INDEX.md"), encoding="utf-8").read())
 
         # ⑲ _unstamp 는 줄 끝만 — 사람이 본문에 쓴 날짜를 지우지 않는다
         chk("본문 중간의 ✅ 날짜 보존",

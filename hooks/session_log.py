@@ -156,30 +156,33 @@ def db_set_processed(sid, n, db_path=DB_FILE):
         return False
 
 
-ALERT_FILE = os.path.join(STATE_DIR, "last_failure.txt")
+def _alert_path(db_path=DB_FILE):
+    """**그 DB 옆에** 둔다. 전역 파일로 두면 별도 DB 를 쓰는 dry-run 이
+    운영 경고를 지운다. 뜻은 '이 저장소에 쓰기가 안 된다' 하나다."""
+    return f"{db_path}.alert"
 
 
-def _alert_set(msg):
+def _alert_set(msg, db_path=DB_FILE):
     """**DB 밖에** 남기는 경고. DB 가 죽으면 pending 도 못 쓰는데, 렌더가 DB 만 보면
     그 실패는 다음 렌더 한 번으로 사라진다(체크박스 한 번이면 지워진다)."""
     try:
-        with open(ALERT_FILE, "w", encoding="utf-8") as f:
+        with open(_alert_path(db_path), "w", encoding="utf-8") as f:
             f.write(msg.strip() + "\n")
     except OSError:
         pass
 
 
-def _alert_get():
+def _alert_get(db_path=DB_FILE):
     try:
-        with open(ALERT_FILE, encoding="utf-8") as f:
+        with open(_alert_path(db_path), encoding="utf-8") as f:
             return f.read().strip()
     except OSError:
         return ""
 
 
-def _alert_clear():
+def _alert_clear(db_path=DB_FILE):
     try:
-        os.remove(ALERT_FILE)
+        os.remove(_alert_path(db_path))
     except OSError:
         pass
 
@@ -2259,7 +2262,8 @@ def _write_index(base, open_lines=None, done_lines=None, db_path=DB_FILE, alerts
 
     # DB 가 통째로 죽으면 pending 도 못 쓴다 — 그때는 이번 실행이 **메모리로** 들고 온
     # 사실만이 유일한 근거다. 목차에 못 실으면 그 실패는 어디에도 안 남는다.
-    for a in list(alerts or ()) + ([_alert_get()] if _alert_get() else []):
+    saved = _alert_get(db_path)
+    for a in list(alerts or ()) + ([saved] if saved else []):
         if a and f"⚠ {a}" not in summary_bits:
             summary_bits.append(f"⚠ {a}")
     rows = _pending_rows(db_path)
@@ -2374,6 +2378,12 @@ def _process(transcript, base=None, db_path=DB_FILE, use_llm=True):
         with _vault_lock():
             processed = db_get_processed(sid, db_path)
             if processed is None:
+                # 여기서 조용히 나가면 **이번 세션이 통째로 빠진 사실이 어디에도 안 남는다.**
+                _alert_set("증분 마커를 읽지 못해 이번 세션을 기록하지 못했습니다", db_path)
+                try:
+                    _write_index(base, db_path=db_path)
+                except Exception as e2:
+                    _debug("[worker] 실패 표시 렌더 실패: " + repr(e2))
                 _debug("[worker] ABORT: 증분 마커를 읽지 못했다 — 중복 append 를 막기 위해 중단")
                 return
             if len(all_turns) < processed:  # 트랜스크립트 축소 → 리셋
@@ -2384,12 +2394,18 @@ def _process(transcript, base=None, db_path=DB_FILE, use_llm=True):
                 _debug(f"[worker] SKIP: 새 turn 없음 (processed={processed})")
                 return
             new_meta = {**meta, "turns": new_turns}
-            if _is_excluded(new_meta):  # 제외 마커: '이번 증분'만 제외, 마커는 전진(다음 flush부터 재개)
-                db_set_processed(sid, len(all_turns), db_path)
+            # 제외·사소 경로도 마커가 전진해야 한다. 실패하면 다음 flush 의 증분이
+            # 이 구간을 다시 포함하는데, `#nolog` 는 그 증분 **전체**를 제외하므로
+            # 그 사이에 한 정상 작업까지 함께 버려진다.
+            if _is_excluded(new_meta):  # 제외 마커: '이번 증분'만 제외, 마커는 전진
+                if not db_set_processed(sid, len(all_turns), db_path):
+                    _alert_set("제외 구간의 마커 저장 실패 — 다음 기록이 함께 제외될 수 있습니다",
+                               db_path)
                 _debug("[worker] SKIP: 제외 마커(이번 증분만 제외)")
                 return
             if not is_significant(new_meta):
-                db_set_processed(sid, len(all_turns), db_path)
+                if not db_set_processed(sid, len(all_turns), db_path):
+                    _alert_set("사소 구간의 마커 저장 실패 — 다음 실행이 다시 판정합니다", db_path)
                 _debug("[worker] SKIP: 새 turn 사소 (마커만 전진)")
                 return
             task_skip = _is_task_skipped(new_meta)
@@ -2485,14 +2501,21 @@ def _process(transcript, base=None, db_path=DB_FILE, use_llm=True):
             for dd in weeks.values():
                 _write_weekly_digest(base, dd)
             marked = db_set_processed(sid, processed_upto, db_path)
-            if marked:
-                _alert_clear()          # 쓰기가 되살아났다
+            if marked and _alert_get(db_path):
+                # 쓰기가 되살아났다. **다시 렌더해야** 목차에서 경고가 걷힌다 —
+                # 파일만 지우면 INDEX 는 다음 렌더까지 낡은 경고를 이고 있다.
+                _alert_clear(db_path)
+                try:
+                    _write_index(base, db_path=db_path)
+                except Exception as e2:
+                    _debug("[worker] 경고 해제 렌더 실패: " + repr(e2))
             if not marked:
                 # 마커를 못 남겼으면 다음 실행이 같은 구간을 다시 처리한다.
                 _pending_add(transcript, db_path)
                 # pending 도 같은 DB 라 함께 죽었을 수 있다. **DB 밖에** 적어 두어야
                 # 그 뒤의 평범한 렌더(체크박스 한 번)에도 경고가 지워지지 않는다.
-                _alert_set("증분 마커 저장 실패 — 다음 실행이 같은 구간을 다시 기록합니다")
+                _alert_set("증분 마커 저장 실패 — 다음 실행이 같은 구간을 다시 기록합니다",
+                           db_path)
                 try:
                     _write_index(base, db_path=db_path)
                 except Exception as e2:
@@ -2632,7 +2655,11 @@ def main():
     if "--catchup" in sys.argv:   # 수동 회수: 열린 세션 + 밀린 pending
         seen = set()
         _catchup(seen)
-        for path, _t in (_pending_rows() or []):
+        rows = _pending_rows()
+        if rows is None:
+            print("pending 조회 실패 — DB 를 열 수 없습니다", file=sys.stderr)
+            return 1
+        for path, _t in rows:
             if path in seen:
                 # 방금 catchup 에서 실패해 pending 에 들어온 것이다. 같은 실행에서 또 돌리면
                 # LLM 비용을 두 번 쓰고 tries 만 두 번 오른다.
@@ -2645,6 +2672,10 @@ def main():
         # **현재 세션이 먼저다.** 재시도를 앞에 두면 백로그가 쌓였을 때
         # 방금 끝난 세션의 기록이 몇 시간씩 밀린다(실측: 21건이면 22번째로 처리된다).
         _process(tr)
+        if _pending_rows() is None:
+            # 훅은 종료 코드를 보지만 사람은 안 본다. 조용히 0 으로 끝내지 않는다.
+            _debug("[worker] pending 조회 실패 — 재시도 큐를 확인할 수 없다")
+            return 1
         for old in _pending_list()[:PENDING_DRAIN_PER_RUN]:
             if old != tr and os.path.exists(old):
                 _debug(f"[worker] pending 재시도: {old}")
