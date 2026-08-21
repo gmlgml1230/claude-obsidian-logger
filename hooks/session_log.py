@@ -191,11 +191,19 @@ PENDING_MAX_TRIES = 5
 
 
 def _pending_list(db_path=DB_FILE):
+    """재시도할 수 있는 것만. **원본이 사라진 항목은 지운다** — 트랜스크립트는 30일 뒤
+    삭제되므로, 남겨 두면 영영 처리할 수 없는 건수가 INDEX 경고에 붙박이로 남는다."""
     try:
         with _db_pending(db_path) as c:
-            return [r[0] for r in c.execute(
+            rows = [r[0] for r in c.execute(
                 "SELECT transcript FROM pending WHERE tries < ? ORDER BY ts",
                 (PENDING_MAX_TRIES,)).fetchall()]
+            gone = [r for r in rows if not os.path.exists(r)]
+            for g in gone:
+                c.execute("DELETE FROM pending WHERE transcript=?", (g,))
+            if gone:
+                _debug(f"[worker] pending {len(gone)}건 원본 만료 — 정리")
+            return [r for r in rows if r not in gone]
     except Exception:
         return []
 

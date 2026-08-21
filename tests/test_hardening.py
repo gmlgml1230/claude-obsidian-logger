@@ -133,9 +133,16 @@ def main():
             "tasks_add": [], "_usage": None, "_parts": {}}
         sl._process(tr, base=base, db_path=db)
         chk("성공하면 pending 해제", sl._pending_list(db) == [])
-        for _ in range(sl.PENDING_MAX_TRIES + 1):
-            sl._pending_add("/x/y.jsonl", db)
-        chk("재시도 상한 초과분은 목록에서 빠짐", "/x/y.jsonl" not in sl._pending_list(db))
+        # 상한: 파일이 실제로 있어야 '만료 정리'가 아니라 '상한'으로 빠지는지 검증된다
+        stuck = os.path.join(tmp, "stuck.jsonl"); open(stuck, "w").write("{}\n")
+        sl._pending_add(stuck, db)
+        chk("상한 이내면 목록에 있음", stuck in sl._pending_list(db))
+        for _ in range(sl.PENDING_MAX_TRIES):
+            sl._pending_add(stuck, db)
+        chk("재시도 상한 초과분은 목록에서 빠짐", stuck not in sl._pending_list(db))
+        # 원본이 사라진 항목은 정리된다 (30일 뒤 트랜스크립트 삭제)
+        sl._pending_add("/does/not/exist.jsonl", db)
+        chk("만료된 pending 은 정리", "/does/not/exist.jsonl" not in sl._pending_list(db))
         sl.summarize = real
 
         # ⑩ git 스냅샷은 훅 경로만, 삭제도 반영
