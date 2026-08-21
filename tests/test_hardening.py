@@ -307,8 +307,10 @@ def main():
         # ㉓ 없는 저장소는 캐시하지 않는다
         nd = os.path.join(tmp, "notrepo"); os.makedirs(nd)
         chk("비저장소는 None", sl._repo_root(nd) is None)
+        chk("같은 렌더 안에서는 재조회하지 않는다", nd in sl._REPO_ROOT_CACHE)
         subprocess.run(["git", "-C", nd, "init", "-q"], check=True)
-        chk("뒤늦게 만들어진 저장소도 인식", sl._repo_root(nd) is not None)
+        sl._write_index(bv)      # 렌더 경계에서 캐시가 비워진다
+        chk("렌더가 지나면 뒤늦게 만들어진 저장소도 인식", sl._repo_root(nd) is not None)
 
         # ㉔ 시각만 달라진 렌더는 파일을 건드리지 않는다
         p_idx = os.path.join(bv, "INDEX.md")
@@ -317,6 +319,28 @@ def main():
         sl._write_index(bv)
         chk("시각만 다른 재렌더는 무변경", open(p_idx, encoding="utf-8").read() == before)
         chk("파일을 다시 쓰지도 않는다", os.path.getmtime(p_idx) == mt)
+        # 시각 '값' 만 정규화한다 — 줄 전체를 지우면 문구를 고쳐도 반영되지 않는다
+        open(p_idx, "w", encoding="utf-8").write(before.replace("에 갱신됐습니다", "기준입니다"))
+        sl._write_index(bv)
+        chk("머리말 문구 변경은 반영된다",
+            "에 갱신됐습니다" in open(p_idx, encoding="utf-8").read())
+
+        # ㉕ DB 조회 실패는 '빈 큐' 와 구분된다
+        chk("조회 실패는 None", sl._pending_rows(os.path.join(tmp, "없는폴더", "x.db")) is None)
+        chk("_pending_list 는 그래도 리스트",
+            sl._pending_list(os.path.join(tmp, "없는폴더", "x.db")) == [])
+
+        # ㉖ DB 밖 경고는 후속 렌더에서도 살아남는다
+        sl._alert_set("증분 마커 저장 실패 — 테스트")
+        sl._write_index(bv)
+        first = "증분 마커 저장 실패" in open(p_idx, encoding="utf-8").read()
+        sl._write_index(bv)
+        again = "증분 마커 저장 실패" in open(p_idx, encoding="utf-8").read()
+        sl._alert_clear(); sl._write_index(bv)
+        gone = "증분 마커 저장 실패" not in open(p_idx, encoding="utf-8").read()
+        chk("경고가 뜬다", first)
+        chk("체크박스 한 번에 지워지지 않는다", again)
+        chk("해제하면 사라진다", gone)
 
         # ⑲ _unstamp 는 줄 끝만 — 사람이 본문에 쓴 날짜를 지우지 않는다
         chk("본문 중간의 ✅ 날짜 보존",

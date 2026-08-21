@@ -156,6 +156,34 @@ def db_set_processed(sid, n, db_path=DB_FILE):
         return False
 
 
+ALERT_FILE = os.path.join(STATE_DIR, "last_failure.txt")
+
+
+def _alert_set(msg):
+    """**DB 밖에** 남기는 경고. DB 가 죽으면 pending 도 못 쓰는데, 렌더가 DB 만 보면
+    그 실패는 다음 렌더 한 번으로 사라진다(체크박스 한 번이면 지워진다)."""
+    try:
+        with open(ALERT_FILE, "w", encoding="utf-8") as f:
+            f.write(msg.strip() + "\n")
+    except OSError:
+        pass
+
+
+def _alert_get():
+    try:
+        with open(ALERT_FILE, encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _alert_clear():
+    try:
+        os.remove(ALERT_FILE)
+    except OSError:
+        pass
+
+
 # ── 실패한 세션 재시도 큐 ───────────────────────────────────────────────────
 def _db_pending(db_path):
     c = _db(db_path)
@@ -193,7 +221,10 @@ PENDING_DRAIN_PER_RUN = 2      # 백로그가 현재 세션 기록을 굶기지 
 
 def _pending_rows(db_path=DB_FILE):
     """[(transcript, tries)] — 원본이 남아 있는 것만. **원본이 사라진 항목은 지운다**
-    (트랜스크립트는 30일 뒤 삭제된다). 남겨 두면 처리할 수 없는 건수가 경고에 붙박이가 된다."""
+    (트랜스크립트는 30일 뒤 삭제된다). 남겨 두면 처리할 수 없는 건수가 경고에 붙박이가 된다.
+
+    **조회 실패는 None** 이다. 빈 리스트로 뭉개면 DB 가 죽었는데 '남은 일 없음' 이 되어
+    복구 자동화가 거짓 성공한다."""
     try:
         with _db_pending(db_path) as c:
             rows = c.execute("SELECT transcript, tries FROM pending ORDER BY ts").fetchall()
@@ -203,14 +234,15 @@ def _pending_rows(db_path=DB_FILE):
             if gone:
                 _debug(f"[worker] pending {len(gone)}건 원본 만료 — 정리")
             return [(t, n) for t, n in rows if t not in gone]
-    except Exception:
-        return []
+    except Exception as e:
+        _debug("pending_rows ERROR: " + repr(e))
+        return None
 
 
 def _pending_list(db_path=DB_FILE):
     """**자동 재시도 대상**. 상한을 넘긴 것은 여기서 빠지지만 경고에서는 빠지지 않는다 —
     자동 재시도를 멈추는 것과 없던 일로 만드는 것은 다르다."""
-    return [t for t, n in _pending_rows(db_path) if n < PENDING_MAX_TRIES]
+    return [t for t, n in (_pending_rows(db_path) or []) if n < PENDING_MAX_TRIES]
 
 
 def _db_usage(db_path):
@@ -1140,8 +1172,12 @@ RENDER_STAMP_PREFIX = "> 이 목차는 "
 
 
 def _strip_stamp(md):
-    return "\n".join(l for l in (md or "").splitlines()
-                      if not l.startswith(RENDER_STAMP_PREFIX))
+    """비교용 정규화. **시각 값만** 지운다 — 줄 전체를 지우면 문구를 고쳐도
+    다른 변경이 없는 한 반영되지 않는다(업그레이드 직후가 바로 그 상황이다)."""
+    return "\n".join(
+        re.sub(r"\*\*\d{4}-\d{2}-\d{2} \d{2}:\d{2}\*\*", "**?**", l)
+        if l.startswith(RENDER_STAMP_PREFIX) else l
+        for l in (md or "").splitlines())
 
 
 def _safe_write_index(path, new_md):
@@ -2002,10 +2038,10 @@ def _repo_root(path):
             root = None
     if root is None:
         root = walk(os.path.realpath(ap))
-    # **음성 결과는 캐시하지 않는다.** 오래 도는 --catchup 도중에 저장소가 생기거나
-    # symlink 가 바뀌면 그 뒤로 계속 틀린 답을 준다.
-    if root:
-        _REPO_ROOT_CACHE[path] = root
+    # 음성 결과도 담는다 — 비저장소 cwd 는 렌더 한 번에 여러 번 조회된다(주제당 2회).
+    # 대신 캐시 수명을 **렌더 1회**로 묶어(_write_index 에서 비운다) 오래 도는 --catchup
+    # 도중에 저장소가 생기거나 symlink 가 바뀌어도 다음 렌더에서 다시 본다.
+    _REPO_ROOT_CACHE[path] = root
     return root
 
 
@@ -2075,6 +2111,7 @@ def _write_index(base, open_lines=None, done_lines=None, db_path=DB_FILE, alerts
     os.makedirs(d, exist_ok=True)
     path = os.path.join(base, INDEX_FILENAME)
     wcache = {}                # 이 렌더 동안만 git 판정을 재사용한다
+    _REPO_ROOT_CACHE.clear()   # 저장소 루트 판정도 렌더 단위로만 재사용한다
     if open_lines is None or done_lines is None:
         cur = open(path, encoding="utf-8").read() if os.path.exists(path) else ""
         o, dn = _split_tasks(cur)
@@ -2222,9 +2259,13 @@ def _write_index(base, open_lines=None, done_lines=None, db_path=DB_FILE, alerts
 
     # DB 가 통째로 죽으면 pending 도 못 쓴다 — 그때는 이번 실행이 **메모리로** 들고 온
     # 사실만이 유일한 근거다. 목차에 못 실으면 그 실패는 어디에도 안 남는다.
-    for a in alerts or ():
-        summary_bits.append(f"⚠ {a}")
+    for a in list(alerts or ()) + ([_alert_get()] if _alert_get() else []):
+        if a and f"⚠ {a}" not in summary_bits:
+            summary_bits.append(f"⚠ {a}")
     rows = _pending_rows(db_path)
+    if rows is None:
+        summary_bits.append("⚠ pending 조회 실패 — 기록 상태를 확인할 수 없습니다")
+        rows = []
     if rows:
         # 조용히 빠지면 '없었던 일' 이 된다. 세는 것은 0토큰이므로 목차에 드러낸다.
         stuck = sum(1 for _, n in rows if n >= PENDING_MAX_TRIES)
@@ -2444,14 +2485,16 @@ def _process(transcript, base=None, db_path=DB_FILE, use_llm=True):
             for dd in weeks.values():
                 _write_weekly_digest(base, dd)
             marked = db_set_processed(sid, processed_upto, db_path)
+            if marked:
+                _alert_clear()          # 쓰기가 되살아났다
             if not marked:
                 # 마커를 못 남겼으면 다음 실행이 같은 구간을 다시 처리한다.
                 _pending_add(transcript, db_path)
-                # **경고를 인자로 넘긴다.** pending 도 같은 DB 라 함께 죽었을 수 있어서,
-                # 렌더가 DB 만 보면 이 실패는 아무 데도 안 남는다.
+                # pending 도 같은 DB 라 함께 죽었을 수 있다. **DB 밖에** 적어 두어야
+                # 그 뒤의 평범한 렌더(체크박스 한 번)에도 경고가 지워지지 않는다.
+                _alert_set("증분 마커 저장 실패 — 다음 실행이 같은 구간을 다시 기록합니다")
                 try:
-                    _write_index(base, db_path=db_path,
-                                 alerts=["증분 마커 저장 실패 — 다음 실행이 같은 구간을 다시 기록합니다"])
+                    _write_index(base, db_path=db_path)
                 except Exception as e2:
                     _debug("[worker] 실패 표시 렌더 실패: " + repr(e2))
             _git_snapshot(base)
@@ -2572,18 +2615,24 @@ def main():
         # 상한(PENDING_MAX_TRIES)을 넘겨 자동 재시도가 멈춘 것까지 **전부** 다시 돌린다.
         # 경고에 이 명령을 적어 두었으므로 여기가 사용자의 복구 경로다.
         rows = _pending_rows()
+        if rows is None:
+            print("pending 조회 실패 — DB 를 열 수 없습니다", file=sys.stderr)
+            return 1
         _debug(f"[retry-pending] 대상 {len(rows)}건")
         for path, _tries in rows:
             print(f"재시도: {path}")
             _process(path)
-        left = len(_pending_rows())
-        print(f"완료 — 남은 pending {left}건")
+        left = _pending_rows()
+        if left is None:
+            print("재시도 후 pending 조회 실패 — DB 를 열 수 없습니다", file=sys.stderr)
+            return 1
+        print(f"완료 — 남은 pending {len(left)}건")
         # 남은 게 있으면 실패다. 종료 코드 0 이면 자동화에서 성공과 구분할 수 없다.
         return 1 if left else 0
     if "--catchup" in sys.argv:   # 수동 회수: 열린 세션 + 밀린 pending
         seen = set()
         _catchup(seen)
-        for path, _t in _pending_rows():
+        for path, _t in (_pending_rows() or []):
             if path in seen:
                 # 방금 catchup 에서 실패해 pending 에 들어온 것이다. 같은 실행에서 또 돌리면
                 # LLM 비용을 두 번 쓰고 tries 만 두 번 오른다.
