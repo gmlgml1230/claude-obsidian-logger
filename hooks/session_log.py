@@ -1101,13 +1101,14 @@ def _activity_mark(lines, today=None, fallback=None):
     return out + (f" · ⚠ {days}일째" if days >= STALE_DAYS else "")
 
 
-def _group_resume(lines):
-    """파일 없는 묶음의 재개 한 줄. 슬러그로 묶여 있는데 '어디서 이어서 하나' 가 없으면
-    그 묶음만 목차에서 막다른 길이 된다(실측: DataHub 묶음에 cd·resume 이 없었다).
-    대화 링크의 sid8 → history.jsonl 로 세션 id 와 작업 경로를 복구한다."""
-    # 링크 형태가 둘이다 — 현행 `conversations/<sid8>_<날짜>` 와
-    # 구설계 `<날짜>_<시각>_<제목>_<sid8>`. 둘 다에서 sid8 을 뽑는다.
-    seen = set()
+def _session_refs(lines):
+    """태스크 줄에 심긴 세션 참조 → [(날짜, sid8, 대화문서 이름)] 최근 순.
+
+    링크 형태가 둘이다 — 현행 `conversations/<sid8>_<날짜>` 와
+    구설계 `<날짜>_<시각>_<제목>_<sid8>`. **구설계 파일도 `conversations/` 안에 있다** —
+    링크에 경로가 안 붙어 있을 뿐이다. 한 곳에서 뽑아 재개 경로와 승격이 같은 것을 본다.
+    """
+    out = {}
     for l in lines:
         for tgt in re.findall(r"\[\[([^\]|]+)", l):
             name = tgt.strip().rpartition("/")[2]
@@ -1119,8 +1120,15 @@ def _group_resume(lines):
                     continue
                 m = re.match(r"(\d{4}-\d{2}-\d{2})", name)
                 date = m.group(1) if m else ""
-            seen.add((date, sid8))
-    for _date, c in sorted(seen, reverse=True):    # 최근 대화부터
+            out[(date, sid8)] = name
+    return [(d, sid, out[(d, sid)]) for d, sid in sorted(out, reverse=True)]
+
+
+def _group_resume(lines):
+    """파일 없는 묶음의 재개 한 줄. 슬러그로 묶여 있는데 '어디서 이어서 하나' 가 없으면
+    그 묶음만 목차에서 막다른 길이 된다(실측: DataHub 묶음에 cd·resume 이 없었다).
+    대화 링크의 sid8 → history.jsonl 로 세션 id 와 작업 경로를 복구한다."""
+    for _date, c, _name in _session_refs(lines):   # 최근 대화부터
         sess, cwd = _history_lookup(c)
         if not (sess and cwd and os.path.isdir(cwd)):
             continue
@@ -1833,31 +1841,26 @@ def _seed_topic(base, slug, title, lines):
         return False                       # 이미 제 모양을 갖춘 파일
     # 그 주제를 가리키던 대화에서 결론·진행을 끌어온다. 승격 시점에 정본이 비어 있으면
     # 사람이 손으로 옮겨야 하고, 안 옮기면 대화가 만료될 때 같이 사라진다.
-    convs = []
-    for l in lines:
-        for c in re.findall(r"\[\[" + re.escape(CONV_DIRNAME) + r"/([^|\]]+)", l):
-            if c.strip() and c.strip() not in convs:
-                convs.append(c.strip())
-    convs.sort(reverse=True)               # 최근 대화가 진행 로그 맨 위
+    refs = _session_refs(lines)[:5]        # 최근 대화가 진행 로그 맨 위
     concl, dropped, blocks = [], [], []
-    for c in convs[:5]:
+    for date, _sid8, name in refs:
         try:
-            ct = open(os.path.join(base, CONV_DIRNAME, f"{c}.md"), encoding="utf-8").read()
+            ct = open(os.path.join(base, CONV_DIRNAME, f"{name}.md"), encoding="utf-8").read()
         except OSError:
             continue
         concl += _dedup_against(_section_items(ct, CONCLUSION_HEADER), concl)
         dropped += _dedup_against(_section_items(ct, DROPPED_HEADER), dropped)
         prog = _section_items(ct, CONV_PROGRESS_HEADER)
         if prog:
-            blocks.append(f"### {c.partition('_')[2]}  [[{CONV_DIRNAME}/{c}|💬 대화]]\n"
+            blocks.append(f"### {date}  [[{CONV_DIRNAME}/{name}|💬 대화]]\n"
                           + "\n".join(f"- {x}" for x in prog))
     date = _last_activity(lines) or datetime.now().strftime("%Y-%m-%d")
     # 재개 좌표. 없으면 목차에 제목만 뜨고 '어디서 이어서 하나'가 다시 사라진다.
     # branch·head 는 넣지 않는다 — 그 세션 당시 값을 모르므로, 지금 값을 적으면
     # '변화 없음'이라는 없는 확신을 만든다(INDEX 는 '기준 HEAD 미기록'으로 표시된다).
     sess = cwd = None
-    for c in convs:                       # 최근 대화부터 — 재개 대상은 마지막 세션이다
-        sess, cwd = _history_lookup(c.partition("_")[0])
+    for _d, sid8, _n in refs:             # 최근 대화부터 — 재개 대상은 마지막 세션이다
+        sess, cwd = _history_lookup(sid8)
         if sess:
             break
     fm = [f"title: {_yaml_val(title)}", "status: active",
@@ -1883,7 +1886,7 @@ def _seed_topic(base, slug, title, lines):
     if body:                               # 사람이 적어 둔 메모는 지우지 않는다
         out += f"\n{body}\n"
     _atomic_write(path, out)
-    _debug(f"[worker] topics/{slug}: 빈 주제 파일 채움 (대화 {len(convs[:5])}건 반영)")
+    _debug(f"[worker] topics/{slug}: 빈 주제 파일 채움 (대화 {len(refs)}건 반영)")
     return True
 
 
@@ -2395,6 +2398,15 @@ def _process(transcript, base=None, db_path=DB_FILE, use_llm=True):
             _debug("[worker] ABORT: transcript 없음")
             return
         meta = parse_transcript(transcript)
+        # 요약기 자신의 `claude -p` 세션은 기록하지 않는다. **여기가 유일한 길목이다** —
+        # `GUARD_ENV` 는 SessionEnd 경로만 막고 `_is_summarizer_session` 은 catchup 안에만
+        # 있어서, `--worker` 나 pending 재시도로 들어오면 그대로 기록된다(실측).
+        # 그 대화의 본문은 요약 프롬프트이고 거기에 **현재 미완료 태스크 목록이 통째로** 들어 있어,
+        # 다음 요약이 그것을 새 태스크로 되돌려 놓는다.
+        if _is_summarizer_session(meta):
+            _pending_clear(transcript, db_path)
+            _debug("[worker] SKIP: 요약기 자신의 세션")
+            return
         sid = meta["session_id"]
         sid8 = sid[:8]
         all_turns = meta["turns"]
@@ -2624,6 +2636,7 @@ def _catchup(done=None):
     root = os.path.expanduser("~/.claude/projects")
     files = [f for f in glob.glob(os.path.join(root, "*", "*.jsonl"))
              if os.path.getmtime(f) >= cutoff]
+    # _process 가 같은 판별을 다시 하지만 여기서 먼저 걸러 트랜스크립트를 두 번 읽지 않는다.
     todo, skipped = [], 0
     for f in files:
         try:

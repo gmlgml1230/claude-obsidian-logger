@@ -378,6 +378,26 @@ def main():
         chk("실제 커밋이 쌓이면 그때 '코드 변경됨'",
             "검증 이후 코드 변경됨" in open(os.path.join(vv, "INDEX.md"), encoding="utf-8").read())
 
+        # ㉖-3 요약기 자신의 세션은 어느 경로로 들어와도 기록하지 않는다
+        sv = os.path.join(tmp, "sv"); os.makedirs(os.path.join(sv, "topics"))
+        sum_tr = os.path.join(tmp, "eeeeeeee-1111-2222-3333-444444444444.jsonl")
+        with open(sum_tr, "w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "type": "user", "timestamp": "2026-08-21T13:00:00Z", "cwd": tmp,
+                "message": {"role": "user", "content": sl.SUMMARY_SIGNATURE +
+                            ". 아래는 한 프로젝트 세션에서 이번에 새로 진행한 대화다. "
+                            "읽고 뽑아라. # 현재 미완료 작업\n- [ ] 되돌아오면 안 되는 태스크"}},
+                ensure_ascii=False) + "\n")
+            f.write(json.dumps({
+                "type": "assistant", "timestamp": "2026-08-21T13:00:01Z", "cwd": tmp,
+                "message": {"role": "assistant", "content": '{"topic": "none"}'}},
+                ensure_ascii=False) + "\n")
+        sl._pending_add(sum_tr, db)
+        sl._process(sum_tr, base=sv, db_path=db)
+        chk("요약기 세션은 대화 문서를 만들지 않는다",
+            not os.path.isdir(os.path.join(sv, "conversations")))
+        chk("요약기 세션은 pending 에서도 빠진다", sum_tr not in sl._pending_list(db))
+
         # ㉗ DB 를 못 읽어 중단할 때도 목차에 남는다
         av = os.path.join(tmp, "av"); os.makedirs(os.path.join(av, "topics"))
         open(os.path.join(av, "INDEX.md"), "w", encoding="utf-8").write(
