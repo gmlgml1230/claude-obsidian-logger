@@ -1391,8 +1391,9 @@ def _fence_spans(txt):
         else:
             spans.append((start, m.end()))
             start = None
-    if start is not None:
-        spans.append((start, len(txt)))
+    # **닫히지 않은 펜스는 버린다.** EOF 까지 마스킹하면 그 뒤의 진짜 헤더가 전부 숨는데,
+    # 대화 문서는 붙여넣기 때문에 펜스가 실제로 자주 어긋난다(실측: vault 133건 중 3건).
+    # 코드블록 안의 헤더를 한 번 잘못 읽는 쪽이, 뒤쪽 섹션을 통째로 잃는 쪽보다 낫다.
     return spans
 
 

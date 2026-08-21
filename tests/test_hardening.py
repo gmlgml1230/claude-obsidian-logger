@@ -258,6 +258,12 @@ def main():
         chk("그래도 다음·진행은 기록됨", "- 실제 다음" in t2 and "- 진행" in t2)
         fenced = '---\ntitle: T\n---\n\n```md\n## 📌 결론\n- 예시\n```\n\n본문\n'
         chk("코드펜스 안의 헤더는 섹션이 아니다", sl._find_header(fenced, "## 📌 결론") == -1)
+        # 닫히지 않은 펜스가 뒤쪽 섹션을 통째로 숨기면 안 된다 (실제 대화 문서에서 흔하다)
+        unclosed = "---\ntitle: T\n---\n\n```\n예시\n\n## 📌 결론\n\n- 진짜 결론\n"
+        chk("닫히지 않은 펜스 뒤의 헤더는 보인다",
+            sl._find_header(unclosed, "## 📌 결론") != -1)
+        chk("그 섹션의 항목도 읽힌다",
+            sl._section_items(unclosed, "## 📌 결론") == ["진짜 결론"])
         chk("그래서 실제 섹션을 만든다",
             sl._ensure_sections(fenced).rstrip().endswith("## 🔜 다음"))
 
