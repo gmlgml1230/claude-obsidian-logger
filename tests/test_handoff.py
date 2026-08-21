@@ -42,6 +42,7 @@ def main():
     tmp = tempfile.mkdtemp()
     try:
         vault, repo = os.path.join(tmp, "vault"), os.path.join(tmp, "repo")
+        sl.DEBUG_LOG_DIR = tmp      # 테스트 흔적이 실제 디버그 로그를 오염시키지 않게
         os.makedirs(os.path.join(vault, "topics")); os.makedirs(repo)
         head = make_repo(repo)
         open(os.path.join(vault, "topics", "demo.md"), "w", encoding="utf-8").write(

@@ -46,6 +46,7 @@ def main():
     tmp = tempfile.mkdtemp()
     try:
         vault = os.path.join(tmp, "vault")
+        sl.DEBUG_LOG_DIR = tmp      # 테스트 흔적이 실제 디버그 로그를 오염시키지 않게
         build(vault)
         tp = os.path.join(vault, "topics", "airflow-incident.md")
 
