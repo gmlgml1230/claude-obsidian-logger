@@ -1960,27 +1960,35 @@ def _repo_root(path):
         return None
     if path in _REPO_ROOT_CACHE:
         return _REPO_ROOT_CACHE[path]
+    def walk(start):
+        q = start
+        while q and q != "/":
+            if os.path.exists(os.path.join(q, ".git")):
+                return q
+            nxt = os.path.dirname(q)
+            if nxt == q:
+                return None
+            q = nxt
+        return None
+
+    ap = os.path.abspath(path)
     root = None
-    try:
-        # `.git` 을 직접 찾아 올라가면 **symlink 에서 틀린다** — 저장소 밖을 가리키는
-        # 링크는 못 찾고, 상위 저장소 안에 있는 링크는 엉뚱하게 상위를 집는다(실측).
-        # git 이 같은 경로에 대해 정답을 알고 있으므로 그쪽에 묻는다.
-        r = subprocess.run(["git", "-C", path, "rev-parse", "--show-toplevel"],
-                           capture_output=True, text=True, timeout=10)
-        if r.returncode == 0 and r.stdout.strip():
-            root = r.stdout.strip()
-    except Exception:
-        root = None
-    if root is None:                       # git 이 없거나 실패하면 옛 방식으로 폴백
-        p = os.path.abspath(path)
-        while p and p != "/":
-            if os.path.exists(os.path.join(p, ".git")):
-                root = p
-                break
-            nxt = os.path.dirname(p)
-            if nxt == p:
-                break
-            p = nxt
+    # symlink 이 없는 흔한 경우는 파일 시스템만 봐도 답이 같다 — git 을 부르면
+    # 렌더가 주제 수만큼 느려진다(실측: 268ms → 407ms).
+    if os.path.realpath(ap) == ap:
+        root = walk(ap)
+    if root is None:
+        try:
+            # `.git` 을 찾아 올라가는 방식은 **symlink 에서 틀린다** — 저장소 밖을 가리키는
+            # 링크는 못 찾고, 상위 저장소 안에 있는 링크는 엉뚱하게 상위를 집는다(실측).
+            r = subprocess.run(["git", "-C", path, "rev-parse", "--show-toplevel"],
+                               capture_output=True, text=True, timeout=10)
+            if r.returncode == 0 and r.stdout.strip():
+                root = r.stdout.strip()
+        except Exception:
+            root = None
+    if root is None:
+        root = walk(os.path.realpath(ap))
     _REPO_ROOT_CACHE[path] = root
     return root
 
