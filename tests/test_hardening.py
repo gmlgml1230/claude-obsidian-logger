@@ -162,6 +162,71 @@ def main():
         chk("스냅샷: 삭제 반영", "topics/a.md" in show and "D\t" in show)
         chk("스냅샷: 신규 반영", "topics/b.md" in show)
         chk("스냅샷: 사람 노트 제외", "내노트" not in show)
+        os.remove(os.path.join(g, "topics", "b.md"))
+        open(os.path.join(g, "INDEX.md"), "w").write("i")
+        sl._git_snapshot(g)
+        os.remove(os.path.join(g, "INDEX.md"))
+        sl._git_snapshot(g)
+        show = subprocess.run(["git", "-C", g, "show", "--name-status", "HEAD"],
+                              capture_output=True, text=True).stdout
+        chk("스냅샷: 최상위 파일 삭제도 커밋", "D\tINDEX.md" in show)
+
+        # ⑪ 중복 판정은 같은 주제 안에서만, 부분포함은 태스크에서 끈다
+        chk("교차 주제 같은 문구는 각자 생긴다",
+            len(sl._apply_task_adds(["- [ ] VM 재배포  [[topics/alpha|🔧]]"],
+                                    [{"text": "VM 재배포"}], "beta", None)) == 2)
+        chk("앞 단계가 뒤 단계의 부분문자열이어도 남는다",
+            len(sl._apply_task_adds(["- [ ] 운영 데이터 백필"],
+                                    [{"text": "운영 데이터 백필 결과 검증"}], None, None)) == 2)
+
+        # ⑫ 결론·접은 안도 한 줄, _one_line 은 선두 기호를 보존
+        c1 = sl._valid_summary({"topic": "x", "conclusions": ["정상\n## 침입\n- [x] 가짜"]})
+        chk("결론 한 줄 강제", "\n" not in c1["conclusions"][0])
+        chk("_one_line: CLI 옵션 보존", sl._one_line("--force 없이 재실행") == "--force 없이 재실행")
+        chk("_one_line: 이슈 번호 보존", sl._one_line("#123 확인") == "#123 확인")
+        chk("_one_line: 불릿은 제거", sl._one_line("- 불릿") == "불릿")
+        chk("_one_line: 잘리면 표시", sl._one_line("가" * 400).endswith("…"))
+
+        # ⑬ frontmatter 문자열을 섹션으로 오인하지 않는다
+        chk("헤더는 줄 전체로만 인식",
+            sl._ensure_sections('---\ntitle: "## 📌 결론"\n---\n\n본문\n')
+            .count("\n## 📌 결론") == 1)
+
+        # ⑭ 같은 구간 재처리가 대화·daily 를 두 번 쌓지 않는다
+        turns = [("user", ["안녕하세요 반갑습니다"], None)]
+        for _ in range(2):
+            sl._write_conversation_page(base, "ab12cd34", "2026-08-21", turns, "T", "- 진행")
+            sl._append_daily(base, "2026-08-21", "t", "- 진행", "conversations/ab12cd34_2026-08-21")
+        cp = open(os.path.join(base, "conversations", "ab12cd34_2026-08-21.md"), encoding="utf-8").read()
+        chk("대화 본문 1회만", cp.count("안녕하세요 반갑습니다") == 1)
+        chk("daily 1줄만",
+            open(os.path.join(base, "daily", "2026-08-21.md"), encoding="utf-8").read().count("[t]") == 1)
+
+        # ⑮ 완료일은 최신, 열린 줄에는 스탬프가 없다
+        chk("열린 줄 스탬프 제거", "✅" not in sl._unstamp("- [ ] X ✅ 2026-01-01"))
+        with sl._db_tasks(db) as c:
+            for ts in ("2026-01-01T00:00:00", "2026-08-21T00:00:00"):
+                c.execute("INSERT INTO task_events VALUES(?,?,?)", ("k", "done", ts))
+        chk("재완료 시 최신 완료일", sl._completion_date("k", "fb", db) == "2026-08-21")
+
+        # ⑯ 재시도 상한을 넘겨도 경고 집계에는 남는다
+        stuck2 = os.path.join(tmp, "stuck2.jsonl"); open(stuck2, "w").write("{}")
+        for _ in range(sl.PENDING_MAX_TRIES + 1):
+            sl._pending_add(stuck2, db)
+        chk("상한 초과: 자동 재시도 제외", stuck2 not in sl._pending_list(db))
+        chk("상한 초과: 경고에는 남음",
+            any(t == stuck2 and n >= sl.PENDING_MAX_TRIES for t, n in sl._pending_rows(db)))
+
+        # ⑰ task_key 규칙 교체 시 가짜 완료 이벤트를 만들지 않는다
+        vault2 = os.path.join(tmp, "v2"); os.makedirs(vault2)
+        db2 = os.path.join(tmp, "m.db")
+        open(os.path.join(vault2, "INDEX.md"), "w", encoding="utf-8").write(
+            "# I\n\n## ☑️ 기타 태스크\n\n- [ ] 열린 일  [[topics/a|🔧]]\n\n"
+            "## ✅ 완료 (2주 보관)\n\n- [x] 끝난 일  [[topics/a|🔧]] ✅ 2026-01-05\n")
+        sl._sync_task_states(vault2, db2)
+        with sl._db_tasks(db2) as c:
+            n_ev = c.execute("SELECT count(*) FROM task_events").fetchone()[0]
+        chk("키 교체 첫 실행: 이벤트 0건", n_ev == 0)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("\n" + ("=== 전부 통과 ===" if not FAIL else f"=== 실패 {len(FAIL)}건: {FAIL} ==="))

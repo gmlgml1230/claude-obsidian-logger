@@ -190,22 +190,26 @@ def _pending_clear(path, db_path=DB_FILE):
 PENDING_MAX_TRIES = 5
 
 
-def _pending_list(db_path=DB_FILE):
-    """재시도할 수 있는 것만. **원본이 사라진 항목은 지운다** — 트랜스크립트는 30일 뒤
-    삭제되므로, 남겨 두면 영영 처리할 수 없는 건수가 INDEX 경고에 붙박이로 남는다."""
+def _pending_rows(db_path=DB_FILE):
+    """[(transcript, tries)] — 원본이 남아 있는 것만. **원본이 사라진 항목은 지운다**
+    (트랜스크립트는 30일 뒤 삭제된다). 남겨 두면 처리할 수 없는 건수가 경고에 붙박이가 된다."""
     try:
         with _db_pending(db_path) as c:
-            rows = [r[0] for r in c.execute(
-                "SELECT transcript FROM pending WHERE tries < ? ORDER BY ts",
-                (PENDING_MAX_TRIES,)).fetchall()]
-            gone = [r for r in rows if not os.path.exists(r)]
+            rows = c.execute("SELECT transcript, tries FROM pending ORDER BY ts").fetchall()
+            gone = [t for t, _ in rows if not os.path.exists(t)]
             for g in gone:
                 c.execute("DELETE FROM pending WHERE transcript=?", (g,))
             if gone:
                 _debug(f"[worker] pending {len(gone)}건 원본 만료 — 정리")
-            return [r for r in rows if r not in gone]
+            return [(t, n) for t, n in rows if t not in gone]
     except Exception:
         return []
+
+
+def _pending_list(db_path=DB_FILE):
+    """**자동 재시도 대상**. 상한을 넘긴 것은 여기서 빠지지만 경고에서는 빠지지 않는다 —
+    자동 재시도를 멈추는 것과 없던 일로 만드는 것은 다르다."""
+    return [t for t, n in _pending_rows(db_path) if n < PENDING_MAX_TRIES]
 
 
 def _db_usage(db_path):
@@ -254,9 +258,37 @@ def _task_states(md):
     return states
 
 
+TASK_KEY_VERSION = 2      # 2: 키에 주제 슬러그 포함
+
+
+def _task_key_migrate(base, db_path):
+    """키 규칙이 바뀌면 **이벤트를 만들지 않고** snapshot 만 다시 세운다.
+
+    안 하면 이미 완료된 항목 전부가 '오늘 새로 완료' 로 기록되고, 과거 완료 이벤트는
+    새 키로 조회되지 않아 완료일이 오늘로 바뀐다."""
+    try:
+        with _db_tasks(db_path) as c:
+            c.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
+            r = c.execute("SELECT v FROM meta WHERE k='task_key_version'").fetchone()
+            if r and int(r[0]) >= TASK_KEY_VERSION:
+                return
+            tf = os.path.join(base, INDEX_FILENAME)
+            cur = _task_states(open(tf, encoding="utf-8").read()) if os.path.exists(tf) else {}
+            c.execute("DELETE FROM task_snapshot")
+            c.executemany("INSERT INTO task_snapshot(task_key, status) VALUES(?,?)",
+                          list(cur.items()))
+            c.execute("INSERT INTO meta(k, v) VALUES('task_key_version', ?) "
+                      "ON CONFLICT(k) DO UPDATE SET v=?",
+                      (str(TASK_KEY_VERSION), str(TASK_KEY_VERSION)))
+            _debug(f"[worker] task_key v{TASK_KEY_VERSION} 로 snapshot 재구축 ({len(cur)}건, 이벤트 없음)")
+    except Exception as e:
+        _debug("task_key_migrate ERROR: " + repr(e))
+
+
 def _sync_task_states(base, db_path=DB_FILE):
     """작업현황 현재 상태 vs snapshot diff → open→done 전이를 그 시각으로 task_events에 기록.
     FileChanged hook(외부 편집 즉시) + SessionEnd(폴백) 양쪽에서 호출."""
+    _task_key_migrate(base, db_path)
     tf = os.path.join(base, INDEX_FILENAME)
     if not os.path.exists(tf):
         return
@@ -280,8 +312,9 @@ def _completion_date(task_key, fallback, db_path=DB_FILE):
     """task_events에서 실제 완료 시각(날짜) 조회. 없으면 fallback."""
     try:
         with _db_tasks(db_path) as c:
+            # 최신 완료를 쓴다. 체크를 풀었다 다시 체크하면 **이번** 완료일이 맞다.
             r = c.execute("SELECT ts FROM task_events WHERE task_key=? AND status='done' "
-                          "ORDER BY ts LIMIT 1", (task_key,)).fetchone()
+                          "ORDER BY ts DESC LIMIT 1", (task_key,)).fetchone()
             if r and r[0]:
                 return r[0][:10]
     except Exception:
@@ -654,8 +687,10 @@ def _valid_summary(parsed):
     return {
         "topic": parsed.get("topic"),
         "topic_new": _norm_topic_new(parsed.get("topic_new")),
-        "conclusions": [str(x) for x in (parsed.get("conclusions") or []) if str(x).strip()],
-        "dropped": [str(x) for x in (parsed.get("dropped") or []) if str(x).strip()],
+        # 결론·접은 안도 문서에 그대로 들어간다 — 개행이 남으면 `## ` 가 새 섹션 경계를
+        # 만들고 `- [x] …` 가 가짜 완료 태스크로 렌더된다.
+        "conclusions": [y for y in (_one_line(x) for x in (parsed.get("conclusions") or [])) if y],
+        "dropped": [y for y in (_one_line(x) for x in (parsed.get("dropped") or [])) if y],
         "progress": parsed.get("progress"),
         "resume": parsed.get("resume"),
         "verified": parsed.get("verified"),
@@ -689,7 +724,10 @@ def _one_line(s, cap=300):
     `- [x] 가짜 완료` 로 렌더되고, resume 에 `## ` 가 남으면 주제 파일에 없던 섹션 경계가 생긴다.
     """
     s = " ".join(str(s or "").split())
-    return re.sub(r"^[#>\-*\s]+", "", s)[:cap].strip()
+    # **공백을 동반한** 마크다운 토큰만 뗀다. `[#>\-*]+` 로 훑으면
+    # `--force 없이 재실행` 이 `force 없이…` 가 되고 `#123 이슈` 가 `123 이슈` 가 된다.
+    s = re.sub(r"^(?:[#>*]+\s+|-\s+)+", "", s).strip()
+    return s if len(s) <= cap else s[:cap].rstrip() + "…"
 
 
 def _clean_progress(s, cap=300):
@@ -852,6 +890,12 @@ def _stamp_done(line, date_str):
     return line if "✅" in line else f"{line} ✅ {date_str}"
 
 
+def _unstamp(line):
+    """열린 줄의 `✅ 날짜` 제거. 체크를 풀었는데 스탬프가 남으면 weekly 가 그 항목을
+    계속 완료로 세고, 사람 눈에도 '완료인데 열려 있는' 모순으로 보인다."""
+    return re.sub(r"\s*✅\s*\d{4}-\d{2}-\d{2}", "", line).rstrip()
+
+
 # 앞의 들여쓰기까지 흡수한다 — 렌더가 매번 탭을 새로 붙이므로 여기서 정규화하지 않으면
 # 재렌더마다 탭이 누적되고 번호 패턴이 매칭되지 않는다.
 # 주제 줄: - [ ] **3.** [[topics/slug|제목]] …   (태스크는 **3-1** 이라 겹치지 않는다)
@@ -943,9 +987,12 @@ def _apply_task_adds(open_cur, adds, topic, conv_link, topic_title=""):
     out = list(open_cur)
     for a in adds or []:
         text = a["text"]
-        if _dedup_against([text], [re.sub(r"\[\[.*?\]\]", "", l) for l in out],
-                          threshold=TASK_DUP_RATIO) == []:
-            _debug(f"[worker] 태스크 중복 — 건너뜀: {text[:40]}")
+        # **같은 주제 안에서만** 중복을 본다. 링크를 지우고 전체와 비교하면
+        # 주제 A 의 'VM 재배포' 때문에 주제 B 의 'VM 재배포' 가 생기지 못한다.
+        peers = [l for l in out if _task_topic(l) == topic]
+        if _dedup_against([text], [re.sub(r"\[\[.*?\]\]", "", l) for l in peers],
+                          threshold=TASK_DUP_RATIO, substr=False) == []:
+            _debug(f"[worker] 태스크 중복({topic or '무소속'}) — 건너뜀: {text[:40]}")
             continue
         line = f"- [ ] {text}"
         if topic:
@@ -1136,6 +1183,7 @@ def _update_tasks(base, open_new, done_cur, db_path=DB_FILE, base_keys=None):
     if revived:
         _debug(f"[worker] 락 대기 중 사람이 편집한 태스크 {len(revived)}건 복원")
         open_new = list(open_new or []) + revived
+    open_new = [_unstamp(o) for o in open_new]
     today = datetime.now().strftime("%Y-%m-%d")
     done_keys = {_task_key(d) for d in done_cur}
     open_new = [o for o in (open_new or []) if _task_key(o) not in done_keys]
@@ -1164,8 +1212,25 @@ def _git_snapshot(base):
         return
     # **훅이 쓰는 경로만** 담는다. `add -A` 는 사용자가 편집 중이던 노트까지 끌어와
     # 'auto: SessionEnd flush' 라는 이름으로 남의 작업을 커밋한다.
-    owned = [p for p in (INDEX_FILENAME, ARCHIVE_FILENAME, TOPICS_DIRNAME, CONV_DIRNAME,
-                         "daily", "weekly") if os.path.exists(os.path.join(base, p))]
+    names = (INDEX_FILENAME, ARCHIVE_FILENAME, TOPICS_DIRNAME, CONV_DIRNAME, "daily", "weekly")
+    tracked = set()
+    try:
+        r = subprocess.run(["git", "-C", base, "ls-files", "--", *names],
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode == 0:
+            tracked = {l.split("/", 1)[0] for l in r.stdout.splitlines() if l}
+    except Exception:
+        pass
+    def has_content(path):
+        if os.path.isfile(path):
+            return True
+        return any(fs for _r, _d, fs in os.walk(path)) if os.path.isdir(path) else False
+
+    # 존재 여부만 보면 ① 삭제된 최상위 파일이 pathspec 에서 빠져 삭제가 커밋되지 않고,
+    # ② 빈 디렉터리가 pathspec 에 들어가 `git commit` 전체가
+    # "did not match any file(s) known to git" 로 실패한다 — 스테이징만 되고 커밋은 안 된다(실측).
+    owned = [p for p in names
+             if p in tracked or has_content(os.path.join(base, p))]
     if not owned:
         return
     try:
@@ -1177,7 +1242,12 @@ def _git_snapshot(base):
         msg = f"auto: SessionEnd flush {datetime.now():%Y-%m-%d %H:%M}"
         r = subprocess.run(["git", "-C", base, "commit", "-m", msg, "--", *owned],
                            capture_output=True, text=True, timeout=60)
-        _debug(f"[worker] git 스냅샷 {'완료' if r.returncode == 0 else '실패'}: {msg}")
+        if r.returncode == 0:
+            _debug(f"[worker] git 스냅샷 완료: {msg}")
+        else:
+            # 사유 없이 '실패' 만 남기면 왜 커밋이 안 됐는지 알 수 없다.
+            _debug(f"[worker] git 스냅샷 실패({r.returncode}): "
+                   f"{(r.stderr or r.stdout).strip()[:200]} · paths={owned}")
     except Exception as e:
         _debug("git 스냅샷 예외: " + repr(e))
 
@@ -1258,6 +1328,11 @@ def _write_conversation_page(base, sid8, date, turns, title=None, progress=None,
     if os.path.exists(path):
         # 같은 날 두 번째 flush. 머리말을 다시 실어 중간에 헤더가 반복되지만,
         # 빼면 두 번째 증분에서 나온 결론이 유실된다 — 중복이 유실보다 낫다.
+        cur = open(path, encoding="utf-8").read()
+        if body.strip() and body.strip() in cur:
+            # 마커 저장이 실패해 **같은 구간을 다시 처리**하는 경우다. 대화를 두 번 싣지 않는다.
+            _debug(f"[worker] {sid8}_{date}: 이미 실린 대화 — 재기록 건너뜀")
+            return
         with open(path, "a", encoding="utf-8") as f:
             f.write("\n" + head_extra + body)
         return
@@ -1280,7 +1355,10 @@ def _append_daily(base, date, label, progress, link_target):
     first = progress.strip().splitlines()[0] if progress.strip() else "진행"
     first = re.sub(r"^-\s*", "", first).strip()
     line = f"- [{label}] {first}  [[{link_target}|↗]]"
-    with open(os.path.join(d, f"{date}.md"), "a", encoding="utf-8") as f:
+    fp = os.path.join(d, f"{date}.md")
+    if os.path.exists(fp) and line in open(fp, encoding="utf-8").read():
+        return          # 같은 구간 재처리 — daily 한 줄이 두 번 쌓이지 않게
+    with open(fp, "a", encoding="utf-8") as f:
         f.write(line + "\n")
 
 
@@ -1293,13 +1371,22 @@ def _topic_slugs(base):
                   for p in glob.glob(os.path.join(d, "*.md")))
 
 
+def _find_header(txt, header, start=0):
+    """본문에서 **줄 전체가** 그 헤더인 위치. frontmatter 의 `title: "## 📌 결론"` 이나
+    코드블록 안의 같은 문자열을 섹션으로 오인하지 않는다(실측: 결론이 엉뚱한 데 붙었다)."""
+    m = re.match(r"^---\n.*?\n---\n", txt, re.S)
+    off = max(start, m.end() if m else 0)
+    mm = re.compile(rf"^{re.escape(header)}[ \t]*$", re.M).search(txt, off)
+    return mm.start() if mm else -1
+
+
 def _section_items(txt, header):
     """'## 헤더' 아래의 '- ' 항목들. 다음 제목(`# ` 또는 `## `)에서 멈춘다.
 
     `## ` 만 보면 대화 문서의 `# 💬 … 대화` 를 넘어가 대화 본문의 '- ' 줄까지 끌어온다
     (마지막 `##` 섹션에서 실측). `### ` 는 진행 로그 블록 머리라 경계로 쓰지 않는다.
     """
-    out, i = [], txt.find(header)
+    out, i = [], _find_header(txt, header)
     # 헤더가 여러 번 나오면 **전부** 모은다. 같은 날 두 번째 flush 는 대화 문서에
     # 머리말을 append 하므로(중복이 유실보다 낫다), 첫 블록만 읽으면 뒤 결론이 사라진다.
     while i != -1:
@@ -1309,7 +1396,7 @@ def _section_items(txt, header):
                 break
             if s.startswith("- ") and s != "- _(없음)_":
                 out.append(s[2:].strip())
-        i = txt.find(header, i + len(header))
+        i = _find_header(txt, header, i + len(header))
     return out
 
 
@@ -1327,18 +1414,22 @@ def _norm_line(s):
     return re.sub(r"[\s`*_·,.\-—()\[\]]+", "", s).lower()
 
 
-def _dedup_against(items, existing, threshold=0.75):
+def _dedup_against(items, existing, threshold=0.75, substr=True):
     """기존 항목과 유사한 것을 걸러낸다. 요약기는 기존 목록을 못 보므로
-    (topic 이 같은 콜에서 정해져 프롬프트에 미리 넣을 수 없다) 파이썬에서 막는다."""
+    (topic 이 같은 콜에서 정해져 프롬프트에 미리 넣을 수 없다) 파이썬에서 막는다.
+
+    `substr=False` 는 **태스크용**이다. 순차 로드맵은 앞 단계가 뒤 단계의 부분 문자열인 것이
+    정상이라('운영 데이터 백필' → '운영 데이터 백필 결과 검증') 포함 판정이 곧바로 유실이 된다.
+    """
     norm = _norm_line
     out, seen = [], [norm(e) for e in existing]
     for it in items:
         n = norm(it)
         if not n:
             continue
-        # 부분 포함 검사에는 최소 길이를 둔다 — 짧은 항목이 긴 항목의 우연한 부분 문자열로
-        # 걸려 사라진다("배포" 가 "VM 재배포…" 에 포함되는 식).
-        if any((len(n) >= SUBSTR_MIN and (n in e or e in n))
+        # 부분 포함 검사의 최소 길이는 **짧은 쪽**에 건다. 새 항목 길이만 보면
+        # 기존의 "배포" 가 새 "VM 재배포 후 검증" 안에 있다는 이유로 새 항목이 사라진다.
+        if any((substr and min(len(n), len(e)) >= SUBSTR_MIN and (n in e or e in n))
                or difflib.SequenceMatcher(None, n, e).ratio() >= threshold
                for e in seen):
             continue
@@ -1352,7 +1443,7 @@ def _append_section(txt, header, items):
     기존 줄은 절대 고치지 않는다 — 사람이 다듬은 문장을 훅이 덮지 않기 위함."""
     if not items:
         return txt
-    i = txt.find(header)
+    i = _find_header(txt, header)
     if i == -1:
         return txt
     j = txt.find("\n## ", i + 1)
@@ -1448,7 +1539,7 @@ def _ensure_sections(txt):
     `_append_section` 은 헤더가 없으면 무동작이고 `_append_topic` 은 성공을 돌려주므로,
     섹션이 빠진 주제 파일에서는 결론·접은 안이 **성공 로그를 남기고 사라진다.**
     사람이 frontmatter 만 적어 만든 주제가 정확히 그 상태다."""
-    missing = [h for h in TOPIC_SECTIONS if h not in txt]
+    missing = [h for h in TOPIC_SECTIONS if _find_header(txt, h) == -1]
     if not missing:
         return txt
     return txt.rstrip() + "".join(f"\n\n{h}\n" for h in missing) + "\n"
@@ -1902,6 +1993,7 @@ def _write_index(base, open_lines=None, done_lines=None):
             line += f" — {m['next']}"
         # 재개 한 줄. 원본이 30일 지나 지워졌으면 문서 재개로 안내한다.
         sess, cwd = m.get("session"), m.get("cwd")
+        ws = _workspaces(m)          # 재개 명령과 검증 무효화가 같은 목록을 본다
         if not cwd and m.get("plan"):
             # cwd 가 없으면 plan 이 있는 저장소를 시작 위치로 삼는다 — 명령이 아예 없는 것보다 낫다
             # 변수명이 d 면 바깥의 topics 디렉터리를 덮어써 아래 묶음 제목 조회가 틀어진다
@@ -1920,7 +2012,6 @@ def _write_index(base, open_lines=None, done_lines=None):
                 docs += f" 와 {m['plan']}"
             boot = (f"{docs} 를 읽고, 기록 시점과 지금 git 상태의 차이를 먼저 보고한 뒤 "
                     f"남은 일부터 이어서 하자")
-            ws = _workspaces(m)
             extra = " ".join(f"--add-dir {shlex.quote(w)}" for w, _ in ws if w != cwd)
             if _resumable(sess):
                 # 여러 저장소에 걸친 주제는 재개해도 나머지 저장소에 접근 권한이 없다.
@@ -1959,8 +2050,10 @@ def _write_index(base, open_lines=None, done_lines=None):
                 note = " (검증 시점 미기록)"
             elif any("커밋" in w or "분기" in w for w in _repo_warnings(cwd, None, vh, cache=wcache)):
                 note = " ⚠ 검증 이후 코드 변경됨"
-            elif any("미커밋" in w for w in _repo_warnings(cwd, cache=wcache)):
-                # 커밋만 보면 같은 HEAD 에서 작업트리만 고친 경우를 놓친다.
+            elif any("미커밋" in w for wp, _wh in (ws or [(cwd, None)])
+                     for w in _repo_warnings(wp, cache=wcache)):
+                # 커밋만 보면 같은 HEAD 에서 작업트리만 고친 경우를 놓치고,
+                # cwd 만 보면 한 주제가 걸친 **보조 저장소**의 변경을 놓친다.
                 note = " ⚠ 검증 이후 미커밋 변경 있음"
             line += f"\n  ✅ 확인: {m['verified']}{note}"
         for j, l in enumerate(mine, 1):
@@ -1968,7 +2061,7 @@ def _write_index(base, open_lines=None, done_lines=None):
         if st != "paused":
             if newest is None:
                 newest = (m.get("title") or slug, _ago(m.get("updated") or m.get("created")))
-            for wpath, _wh in _workspaces(m):
+            for wpath, _wh in ws:
                 nm = os.path.basename(wpath)
                 if nm not in dirty_repos and any("미커밋" in w for w in _repo_warnings(wpath, cache=wcache)):
                     dirty_repos.append(nm)
@@ -1991,10 +2084,13 @@ def _write_index(base, open_lines=None, done_lines=None):
             g += "\n\t" + _numbered(l, f"{n}-{j}")
         groups.append(g)
 
-    n_pending = len(_pending_list())
-    if n_pending:
+    rows = _pending_rows()
+    if rows:
         # 조용히 빠지면 '없었던 일' 이 된다. 세는 것은 0토큰이므로 목차에 드러낸다.
-        summary_bits.append(f"⚠ 기록 실패 {n_pending}세션 — `session_log.py --catchup`")
+        stuck = sum(1 for _, n in rows if n >= PENDING_MAX_TRIES)
+        bit = f"⚠ 기록 실패 {len(rows)}세션"
+        bit += f"({stuck}건 자동 재시도 중단 — 수동 조치 필요)" if stuck else " — 다음 세션에서 재시도"
+        summary_bits.append(bit)
     summary_bits.append(f"진행 중 {len(active)}개")
     if newest:
         summary_bits.append(f"가장 최근 **{newest[0]}**({newest[1]})")
@@ -2056,6 +2152,8 @@ def _write_weekly_digest(base, ref=None):
         fp = os.path.join(base, fn)
         if os.path.exists(fp):
             for ln in open(fp, encoding="utf-8").read().splitlines():
+                if not ln.lstrip().lower().startswith("- [x]"):
+                    continue          # 스탬프만 보면 체크를 푼 항목도 완료로 센다
                 dd = _done_date(ln)
                 if dd and wk_start <= dd <= wk_end:
                     done.append(ln.strip())
@@ -2199,6 +2297,12 @@ def _process(transcript, base=None, db_path=DB_FILE, use_llm=True):
             _git_snapshot(base)
             _debug(f"[worker] DONE: +{processed_upto - processed}turn, {done_groups}/{len(groups)}일")
     except Exception as e:
+        # 요약은 됐는데 파일 쓰기에서 터진 경우가 여기로 온다. pending 에 넣지 않으면
+        # 마커는 그대로여도 **다시 실행될 계기가 없다.**
+        try:
+            _pending_add(transcript, db_path)
+        except Exception:
+            pass
         import traceback
         _debug("[worker] ERROR: " + repr(e) + "\n" + traceback.format_exc())
 
