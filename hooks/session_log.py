@@ -1151,14 +1151,18 @@ def _topic_slugs(base):
 
 
 def _section_items(txt, header):
-    """'## 헤더' 아래의 '- ' 항목들. 다음 '## ' 에서 멈춘다."""
+    """'## 헤더' 아래의 '- ' 항목들. 다음 제목(`# ` 또는 `## `)에서 멈춘다.
+
+    `## ` 만 보면 대화 문서의 `# 💬 … 대화` 를 넘어가 대화 본문의 '- ' 줄까지 끌어온다
+    (마지막 `##` 섹션에서 실측). `### ` 는 진행 로그 블록 머리라 경계로 쓰지 않는다.
+    """
     i = txt.find(header)
     if i == -1:
         return []
     out = []
     for ln in txt[i + len(header):].splitlines():
         s = ln.strip()
-        if s.startswith("## "):
+        if re.match(r"^#{1,2}\s", s):
             break
         if s.startswith("- ") and s != "- _(없음)_":
             out.append(s[2:].strip())
@@ -1270,7 +1274,12 @@ def _fm_list(txt, key):
 def _fm_set(txt, key, value):
     m = re.match(r"^---\n(.*?)\n---\n", txt, re.S)
     if not m:
-        return txt
+        # frontmatter 가 없으면 **만들어서** 쓴다. 조용히 건너뛰면 INDEX 에서 체크한
+        # status: done 이 저장되지 않아 다음 렌더에서 체크가 저절로 풀린다
+        # (사람이 Obsidian 에서 만든 빈 주제 파일에서 실측).
+        if txt.lstrip().startswith("---"):
+            return txt      # 닫히지 않은 frontmatter — 망가진 파일은 건드리지 않는다
+        return f"---\n{key}: {value}\n---\n\n" + txt.lstrip("\n")
     fm, line = m.group(1), f"{key}: {value}"
     if re.search(rf"^{re.escape(key)}:.*$", fm, re.M):
         fm = re.sub(rf"^{re.escape(key)}:.*$", line, fm, count=1, flags=re.M)
@@ -1379,6 +1388,105 @@ def _append_topic(base, slug, date, sid8, progress, next_step,
     return True
 
 
+CONV_PROGRESS_HEADER = "## 📈 이날 진행"
+
+
+def _history_lookup(sid8):
+    """~/.claude/history.jsonl 에서 sid8 → (full session id, 작업 경로).
+
+    대화 문서에는 sid8 밖에 없는데 `claude -r` 은 full id 를 받는다. history.jsonl 은
+    트랜스크립트(30일 보관)보다 오래 남아, 만료된 세션의 작업 경로도 여기서만 알 수 있다.
+    """
+    best = None
+    try:
+        with open(os.path.expanduser("~/.claude/history.jsonl"), encoding="utf-8") as f:
+            for ln in f:
+                try:
+                    r = json.loads(ln)
+                except Exception:
+                    continue
+                sid = r.get("sessionId") or ""
+                if sid.startswith(sid8) and r.get("project"):
+                    ts = r.get("timestamp") or 0
+                    if not best or ts > best[0]:
+                        best = (ts, sid, r["project"])
+    except OSError:
+        return None, None
+    return (best[1], best[2]) if best else (None, None)
+
+
+def _seed_topic(base, slug, title, lines):
+    """사람이 만든 **빈 주제 파일**에 뼈대·제목·기존 대화 기록을 채운다.
+
+    '묶음을 주제로 올리려면 topics/<slug>.md 를 만들기만 하면 된다'가 문서화된 경로인데
+    빈 파일은 세 곳에서 조용히 깨진다 — ① 제목이 없어 목차에 슬러그가 그대로 뜨고,
+    ② frontmatter 가 없어 INDEX 주제 체크가 저장되지 않으며,
+    ③ 섹션이 없어 이후 세션의 결론·접은 안이 버려진다(_append_section 은 헤더가 없으면 무동작).
+    **파일을 만들지는 않는다** — 신규 주제 생성은 여전히 사람 몫이다(결정 E).
+    """
+    path = os.path.join(base, TOPICS_DIRNAME, f"{slug}.md")
+    try:
+        txt = open(path, encoding="utf-8").read()
+    except OSError:
+        return False
+    if txt.lstrip().startswith("---"):
+        return False                       # 이미 제 모양을 갖춘 파일
+    # 그 주제를 가리키던 대화에서 결론·진행을 끌어온다. 승격 시점에 정본이 비어 있으면
+    # 사람이 손으로 옮겨야 하고, 안 옮기면 대화가 만료될 때 같이 사라진다.
+    convs = []
+    for l in lines:
+        for c in re.findall(r"\[\[" + re.escape(CONV_DIRNAME) + r"/([^|\]]+)", l):
+            if c.strip() and c.strip() not in convs:
+                convs.append(c.strip())
+    convs.sort(reverse=True)               # 최근 대화가 진행 로그 맨 위
+    concl, dropped, blocks = [], [], []
+    for c in convs[:5]:
+        try:
+            ct = open(os.path.join(base, CONV_DIRNAME, f"{c}.md"), encoding="utf-8").read()
+        except OSError:
+            continue
+        concl += _dedup_against(_section_items(ct, CONCLUSION_HEADER), concl)
+        dropped += _dedup_against(_section_items(ct, DROPPED_HEADER), dropped)
+        prog = _section_items(ct, CONV_PROGRESS_HEADER)
+        if prog:
+            blocks.append(f"### {c.partition('_')[2]}  [[{CONV_DIRNAME}/{c}|💬 대화]]\n"
+                          + "\n".join(f"- {x}" for x in prog))
+    date = _last_activity(lines) or datetime.now().strftime("%Y-%m-%d")
+    # 재개 좌표. 없으면 목차에 제목만 뜨고 '어디서 이어서 하나'가 다시 사라진다.
+    # branch·head 는 넣지 않는다 — 그 세션 당시 값을 모르므로, 지금 값을 적으면
+    # '변화 없음'이라는 없는 확신을 만든다(INDEX 는 '기준 HEAD 미기록'으로 표시된다).
+    sess = cwd = None
+    for c in convs:                       # 최근 대화부터 — 재개 대상은 마지막 세션이다
+        sess, cwd = _history_lookup(c.partition("_")[0])
+        if sess:
+            break
+    fm = [f"title: {_yaml_val(title)}", "status: active",
+          f"created: {date}", f"updated: {date}"]
+    if sess:
+        fm.append(f"session: {sess}")
+    if cwd:
+        fm.append(f"cwd: {cwd}")
+        repo = cwd.rstrip("/").split("/")[-1]
+        if repo:
+            fm.append(f"repos: [{repo}]")
+
+    def sec(header, items):
+        body = "\n".join(f"- {x}" for x in items) if items else "- _(없음)_"
+        return f"{header}\n\n{body}\n\n"
+
+    out = ("---\n" + "\n".join(fm) + "\n---\n\n"
+           + sec(CONCLUSION_HEADER, concl)
+           + sec(DROPPED_HEADER, dropped)
+           + f"{PROGRESS_HEADER}\n\n" + ("\n\n".join(blocks) + "\n\n" if blocks else "")
+           + f"{NEXT_HEADER}\n")
+    body = txt.strip()
+    if body:                               # 사람이 적어 둔 메모는 지우지 않는다
+        out += f"\n{body}\n"
+    _atomic_write(path, out)
+    _debug(f"[worker] topics/{slug}: 빈 주제 파일 채움 (대화 {len(convs[:5])}건 반영)")
+    return True
+
+
 def _sync_topic_status(base):
     """INDEX 에서 체크된 주제를 `topics/<slug>.md` 의 status: done 으로 반영한다.
     주제를 닫는 것도 목차에서 할 수 있어야 한다 — 안 그러면 태스크가 0이 된 주제가
@@ -1401,6 +1509,11 @@ def _sync_topic_status(base):
             continue
         txt = _fm_set(txt, "status", "done")
         txt = _fm_set(txt, "updated", datetime.now().strftime("%Y-%m-%d"))
+        if not re.search(r"^status:\s*done\s*$", txt, re.M):
+            # 성공 로그만 남고 실제로는 안 써지면 '체크가 저절로 풀리는' 현상이 되는데,
+            # 로그가 거짓이라 원인을 찾을 수 없다. 실패는 실패로 남긴다.
+            _debug(f"[worker] topics/{m.group(3)}: status 기록 실패 — frontmatter 확인 필요")
+            continue
         _atomic_write(tp, txt)
         _debug(f"[worker] topics/{m.group(3)}: status → done (INDEX 체크)")
 
@@ -1534,12 +1647,20 @@ def _write_index(base, open_lines=None, done_lines=None):
     d = os.path.join(base, TOPICS_DIRNAME)
     os.makedirs(d, exist_ok=True)
     path = os.path.join(base, INDEX_FILENAME)
-    _sync_topic_status(base)   # 체크된 주제는 목록에서 빠지도록 먼저 반영
     if open_lines is None or done_lines is None:
         cur = open(path, encoding="utf-8").read() if os.path.exists(path) else ""
         o, dn = _split_tasks(cur)
         open_lines = o if open_lines is None else open_lines
         done_lines = dn if done_lines is None else done_lines
+
+    # 빈 주제 파일 채우기. **status 반영보다 먼저**다 — 체크를 저장할 frontmatter 가
+    # 없으면 status: done 이 갈 곳이 없고, 닫히는 주제도 제목 없는 껍데기로 남는다.
+    all_lines = list(open_lines or []) + list(done_lines or [])
+    for slug in _topic_slugs(base):
+        rel = [l for l in all_lines if _task_topic(l) == slug]
+        title = next((a for a in (_task_topic_alias(l) for l in rel) if a), "") or slug
+        _seed_topic(base, slug, title, rel)
+    _sync_topic_status(base)   # 체크된 주제는 목록에서 빠지도록 반영
 
     by_topic, orphan = _open_tasks_by_topic(base, open_lines)
     # 🔜 다음 은 그 주제로 세션이 돌 때만 갱신된다. 태스크만 체크하고 작업을 안 하면
@@ -1571,10 +1692,11 @@ def _write_index(base, open_lines=None, done_lines=None):
         sess, cwd = m.get("session"), m.get("cwd")
         if not cwd and m.get("plan"):
             # cwd 가 없으면 plan 이 있는 저장소를 시작 위치로 삼는다 — 명령이 아예 없는 것보다 낫다
-            d = os.path.dirname(m["plan"])
-            while d and d != "/" and not os.path.isdir(os.path.join(d, ".git")):
-                d = os.path.dirname(d)
-            cwd = d if d and d != "/" else None
+            # 변수명이 d 면 바깥의 topics 디렉터리를 덮어써 아래 묶음 제목 조회가 틀어진다
+            pd = os.path.dirname(m["plan"])
+            while pd and pd != "/" and not os.path.isdir(os.path.join(pd, ".git")):
+                pd = os.path.dirname(pd)
+            cwd = pd if pd and pd != "/" else None
         if cwd:
             # 만료됐을 때도 **그대로 실행되는** 명령을 준다. "파일을 읽혀서 재개하라"는
             # 안내문은 사람이 다시 조립해야 하므로 재개 경로가 아니다.
